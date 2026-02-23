@@ -1,0 +1,21 @@
+# ========================
+# Security (สำคัญมาก)
+# ========================
+config.py
+.env
+*.env
+
+# Backup files (ห้ามอัป config องค์กร)
+backup/
+*.json
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS / Editor
+.DS_Store
+Thumbs.db
