@@ -1,2273 +1,1559 @@
-import json
 import os
-import time
-import base64
-import sys
-import meraki
-
-
-def merakiRestore(dir, org, nets, dashboard, logger):
-    """
-    Wrapper function for restore operations. Will iterate across the list of networks and perform applicable
-    restore operations, and return a list of dictionaries of operations with their status.
-    :param dir: path to backup
-    :param networks: list of networks being backed up
-    :param dashboard: Meraki API client
-    :return: operations: list of operations performed with their status
-    """
-    operations = []
-    path = dir
-    if 'organization' in next(os.walk(f"{path}"))[1]:
-        if 'policy_objects' in next(os.walk(f"{path}/organization"))[1]:
-            if ('policy_objects.json' and 'policy_objects_groups.json') in next(os.walk(f"{path}/organization/policy_objects"))[2]:
-                logger.info("Restoring Organization Policy Objects...")
-                operations.append(restoreOrganizationPolicyObjects(org=org, dashboard=dashboard, path=path, logger=logger))
-        if 'ipsec_vpn' in next(os.walk(f"{path}/organization"))[1]:
-            if ('ipsec_vpn.json') in next(os.walk(f"{path}/organization/ipsec_vpn"))[2]:
-                logger.info("Restoring Organization IPsec VPN...")
-                operations.append(restoreOrganizationMxIpsecVpn(org=org, dashboard=dashboard, path=path, logger=logger))
-        if 'vpn_firewall' in next(os.walk(f"{path}/organization"))[1]:
-            if ('vpn_firewall.json') in next(os.walk(f"{path}/organization/vpn_firewall"))[2]:
-                logger.info("Restoring Organization VPN Firewall...")
-                operations.append(restoreOrganizationMxVpnFirewall(org=org, dashboard=dashboard, path=path, logger=logger))
-
-    for net in nets:
-        logger.info(f"Restoring settings for network {net['name']}...")
-        settings_in_backup = next(os.walk(f"{path}/network/{net['name']}"))[1]
-        # Check if firmware in backup matches firmware in target network
-        if 'firmware' in settings_in_backup:
-            checkFirmware(net=net, dashboard=dashboard, path=path, logger=logger)
-        devices_in_network = dashboard.networks.getNetworkDevices(networkId=net['id'])
-        # Restore Network Settings
-        if 'webhooks' in settings_in_backup:
-            if ('webhooks_payload_templates.json' and 'webhooks_servers.json') in next(os.walk(f"{path}/network/{net['name']}/webhooks"))[2]:
-                logger.info("Restoring Webhooks...")
-                operations.append(restoreNetworkWebhooks(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'syslog' in settings_in_backup:
-            if ('syslog.json') in next(os.walk(f"{path}/network/{net['name']}/syslog"))[2]:
-                logger.info("Restoring Syslog...")
-                operations.append(restoreNetworkSyslog(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'snmp' in settings_in_backup:
-            if ('snmp.json') in next(os.walk(f"{path}/network/{net['name']}/snmp"))[2]:
-                logger.info("Restoring SNMP...")
-                operations.append(restoreNetworkSnmp(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'alert_settings' in settings_in_backup:
-            if ('alerts.json') in next(os.walk(f"{path}/network/{net['name']}/alert_settings"))[2]:
-                logger.info("Restoring Alerts...")
-                operations.append(restoreNetworkAlerts(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'floorplans' in settings_in_backup:
-            if ('floorplans.json') in next(os.walk(f"{path}/network/{net['name']}/floorplans"))[2]:
-                logger.info("Restoring Floorplans...")
-                fp_operation, ffp = restoreNetworkFloorplans(net=net, dashboard=dashboard, path=path, logger=logger)
-                operations.append(fp_operation)
-        if 'devices' in settings_in_backup:
-            if ('network_devices.json') in next(os.walk(f"{path}/network/{net['name']}/devices"))[2]:
-                logger.info("Restoring Network Device settings...")
-                operation, devices_to_update = restoreNetworkDevices(net=net, org=org, devices_in_network=devices_in_network, dashboard=dashboard, path=path, updated_floorplans=ffp, logger=logger)
-                operations.append(operation)
-        if 'appliance' or 'switch' or 'wireless' in net['productTypes'] and 'group_policies' in settings_in_backup:
-            logger.info("Restoring Group Policies...")
-            operations.append(restoreNetworkGroupPolicies(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'appliance' in net['productTypes'] and 'appliance' in settings_in_backup:
-            if 'settings' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                # Restore MX Settings
-                if 'settings.json' in next(os.walk(f"{path}/network/{net['name']}/appliance/settings"))[2]:
-                    logger.info("Restoring MX appliance settings...")
-                    settings_operation, settings_data = restoreMxSettings(net=net, dashboard=dashboard, path=path, logger=logger)
-                    operations.append(settings_operation)
-            if settings_data['deploymentMode']=="routed":
-                if 'vlans' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                    # Restore VLAN config from vlan_config, vlan_ports and vlan_settings files
-                    # Read if VLANs are enabled in the backup
-                    if 'vlan_settings.json' in next(os.walk(f"{path}/network/{net['name']}/appliance/vlans"))[2]:
-                        # Apply VLAN settings
-                        logger.info("Restoring VLAN settings...")
-                        vlan_settings_operation, vlan_settings_data = restoreMxVlanSettings(net=net, dashboard=dashboard, path=path, logger=logger)
-                        operations.append(vlan_settings_operation)
-                        # If VLANs were enabled in the checkpoint, then proceed to configure them individually
-                        if vlan_settings_data['vlansEnabled'] == True and ('vlan_config.json' and 'vlan_ports.json') in next(os.walk(f"{path}/network/{net['name']}/appliance/vlans"))[2]:
-                            logger.info("Restoring MX per VLAN configuration...")
-                            operations.append(restoreMxVlansBatch(org=org, net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'appliance_routing' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                    # Restore MX Static Routing
-                    # Needs to be restored before it is used for Site to Site VPN configs
-                    if 'static_routes.json' in next(os.walk(f"{path}/network/{net['name']}/appliance/appliance_routing"))[2]:
-                        logger.info('Restoring MX Static Routes...')
-                        operations.append(restoreMxStaticRouting(net=net, dashboard=dashboard, path=path, logger=logger))
-            elif settings_data['deploymentMode']=='passthrough':
-                if 'bgp_settings' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                    # Restore MX BGP
-                    if 'bgp.json' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[2]:
-                        logger.info('Restoring MX BGP settings...')
-                        operations.append(restoreMxBgp(net=net, dashboard=dashboard, path=path, logger=logger))
-            if 'security' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                # Restore MX Security Settings
-                if ('amp.json' and 'ips.json') in next(os.walk(f"{path}/network/{net['name']}/appliance/security"))[
-                    2]:
-                    logger.info("Restoring MX Security...")
-                    operations.append(restoreMxSecurity(net=net, dashboard=dashboard, path=path, logger=logger))
-                # Restore MX Firewall Settings
-                if ('l3_fw.json' and 'l7_fw.json') in next(os.walk(f"{path}/network/{net['name']}/appliance/security"))[
-                    2]:
-                    logger.info("Restoring MX Firewall...")
-                    operations.append(restoreMxFirewall(net=net, dashboard=dashboard, path=path, logger=logger))
-                # Restore MX Content Filtering
-                if ('content_filtering.json') in \
-                        next(os.walk(f"{path}/network/{net['name']}/appliance/security"))[
-                            2]:
-                    logger.info("Restoring MX Content Filtering...")
-                    operations.append(restoreMxContentFiltering(net=net, dashboard=dashboard, path=path, logger=logger))
-            if 'shaping' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                # Restore Shaping Settings
-                if ('global_shaping.json' and 'shaping_rules') in \
-                        next(os.walk(f"{path}/network/{net['name']}/appliance/shaping"))[
-                                2]:
-                    logger.info("Restoring MX Shaping...")
-                    operations.append(restoreMxShaping(net=net, dashboard=dashboard, path=path, logger=logger))
-            if 'vpn_config' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                # Restore VPN Settings
-                if ('vpn_config.json') in \
-                        next(os.walk(f"{path}/network/{net['name']}/appliance/vpn_config"))[
-                                2]:
-                    logger.info("Restoring VPN Settings...")
-                    operations.append(restoreMxVpnConfig(net=net, dashboard=dashboard, path=path, logger=logger))
-            if 'sdwan_settings' in next(os.walk(f"{path}/network/{net['name']}/appliance"))[1]:
-                # Restore SDWAN Settings
-                logger.info("Restoring SDWAN Settings...")
-                operations.append(restoreMxSdWanSettings(net=net, dashboard=dashboard, path=path, logger=logger))
-        if 'switch' in net['productTypes']and 'switch' in settings_in_backup:
-            if 'switch_settings' in next(os.walk(f"{path}/network/{net['name']}/switch"))[1]:
-                if 'port_schedules.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    logger.info("Restoring Switch Port Schedules...")
-                    operations.append(restoreSwitchPortSchedules(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'qos_rules.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    logger.info("Restoring Switch QoS...")
-                    operations.append(restoreSwitchQos(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'access_policies.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    logger.info("Restoring Access Policies...")
-                    operations.append(restoreSwitchAccessPolicies(net=net, dashboard=dashboard, path=path, logger=logger))
-                if len(next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[1])>0:
-                    number_of_switches = len(next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[1])
-                    if number_of_switches > 0:
-                        logger.info(f"Restoring switch ports for {number_of_switches} switches...")
-                        # Restore Switch Ports
-                        operations.append(restoreSwitchPortConfigsBatch(org=org, net=net, dashboard=dashboard,
-                                                                        path=path,
-                                                                        devices_in_network=devices_in_network, logger=logger))
-                if 'dhcp_policies.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch DHCP Security
-                    logger.info("Restoring Switch DHCP Policies...")
-                    operations.append(restoreSwitchDhcpSecurity(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_stp.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch STP
-                    logger.info("Restoring Switch STP...")
-                    operations.append(restoreSwitchStp(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_acl.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch ACL
-                    logger.info("Restoring Switch ACL...")
-                    operations.append(restoreSwitchAcl(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_dscp_cos.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch DHCP COS
-                    logger.info("Restoring Switch DHCP COS Mappings...")
-                    operations.append(restoreSwitchDscpCosMap(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_storm_control.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch Storm Control
-                    logger.info("Restoring Switch Storm Control...")
-                    operations.append(restoreSwitchStormControl(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_mtu.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch MTU
-                    logger.info("Restoring Switch MTU...")
-                    operations.append(restoreSwitchMtu(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'switch_link_aggregations.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch Link Aggregation
-                    logger.info("Restoring Switch Link Aggregation...")
-                    operations.append(restoreSwitchLinkAgg(net=net, dashboard=dashboard, path=path, devices_in_network=devices_in_network, logger=logger))
-                if 'switch_settings.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_settings"))[2]:
-                    # Restore Switch Network Settings
-                    logger.info("Restoring Switch Network Settings...")
-                    operations.append(restoreSwitchSettings(net=net, dashboard=dashboard, path=path, logger=logger))
-
-            if 'switch_routing' in next(os.walk(f"{path}/network/{net['name']}/switch"))[1]:
-                if 'ospf.json' in next(os.walk(f"{path}/network/{net['name']}/switch/switch_routing/"))[2]:
-                    # Restore Switch OSPF
-                    logger.info(f"Restoring Switch OSPF for switch...")
-                    operations.append(restoreSwitchOspf(net=net, dashboard=dashboard, path=path, logger=logger))
-                if len(next(os.walk(f"{path}/network/{net['name']}/switch/switch_routing"))[1])>0:
-                    # Restore Switch SVIs
-                    logger.info(f"Restoring Switch SVIs...")
-                    operations.append(restoreSwitchSvis(net=net, dashboard=dashboard, path=path, devices_in_network=devices_in_network, logger=logger))
-                    # Restore Switch Static Routes
-                    logger.info(f"Restoring Switch Static Routes...")
-                    operations.append(restoreSwitchStaticRouting(net=net, dashboard=dashboard, path=path, devices_in_network=devices_in_network, logger=logger))
-
-
-        if 'wireless' in net['productTypes']:
-            if 'ssid_settings' in next(os.walk(f"{path}/network/{net['name']}/wireless"))[1]:
-                if 'ssids.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/ssid_settings/"))[2]:
-                    # Restore SSID Settings
-                    logger.info("Restoring SSID settings...")
-                    operations.append(restoreMrSsidConfigs(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'l3_rules.json' and 'l7_rules.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/ssid_settings/"))[2]:
-                    # Restore SSID FW settings
-                    logger.info("Restoring SSID FW...")
-                    operations.append(restoreMrSsidFW(net=net, dashboard=dashboard, path=path, logger=logger))
-                if 'shaping_rules.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/ssid_settings/"))[2]:
-                    # Restore SSID Shaping settings
-                    logger.info("Restoring SSID Shaping...")
-                    operations.append(restoreMrSsidShaping(net=net, dashboard=dashboard, path=path, logger=logger))
-            if 'radio_settings' in next(os.walk(f"{path}/network/{net['name']}/wireless"))[1]:
-                if 'rf_profiles.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/radio_settings/"))[2]:
-                    # Restore RF Profile settings
-                    logger.info("Restoring RF Profiles...")
-                    operations.append(restoreMrRfProfiles(net=net, dashboard=dashboard, path=path, devices_in_network=devices_in_network, logger=logger))
-            if 'bluetooth_settings' in next(os.walk(f"{path}/network/{net['name']}/wireless"))[1]:
-                if 'network_bluetooth_settings.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/bluetooth_settings/"))[2]:
-                    # Restore Bluetooth settings
-                    logger.info("Restoring MR Bluetooth...")
-                    operations.append(restoreMrBluetooth(net=net, dashboard=dashboard, path=path, devices_in_network=devices_in_network, logger=logger))
-            if 'network_wireless_settings' in next(os.walk(f"{path}/network/{net['name']}/wireless"))[1]:
-                if 'network_wireless_settings.json' in next(os.walk(f"{path}/network/{net['name']}/wireless/network_wireless_settings/"))[2]:
-                    # Restore Wireless Settings
-                    logger.info("Restoring Wireless Network Settings...")
-                    operations.append(restoreMrWirelessSettings(net=net, dashboard=dashboard, path=path, logger=logger))
-    return operations
-
-def restoreMxSettings(net, dashboard, path, logger):
-    """
-    Restore MX Settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxSettings",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/settings/settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        # Apply VLAN settings
-        dashboard.appliance.updateNetworkApplianceSettings(networkId=net['id'], **data)
-        operation['status']="Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        data =""
-        operation['status']=e
-    except Exception as e:
-        logger.error(e)
-        data=""
-        operation["status"]=e
-    return operation, data
-
-def restoreMxVlanSettings(net, dashboard, path, logger):
-    """
-    Restore MX VLAN Settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxVlanSettings",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/vlans/vlan_settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        # Apply VLAN settings
-        dashboard.appliance.updateNetworkApplianceVlansSettings(networkId=net['id'], **data)
-        operation['status']="Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        data =""
-        operation['status']=e
-    except Exception as e:
-        logger.error(e)
-        data=""
-        operation["status"]=e
-    return operation, data
-
-def checkFirmware(net, dashboard, path, logger):
-    """
-    Function to check if the backup firmware versions match the current firmware versions. Discrepancies in firmware versions
-    can cause incompatibilities and make the script fail. Take this into account when restoring and try to back up often.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    with open(f'{path}/network/{net["name"]}/firmware/firmware.json') as fp:
-        backup_firmware = json.load(fp)
-        fp.close()
-    current_firmware = dashboard.networks.getNetworkFirmwareUpgrades(net['id'])
-    prods_in_backup = {product:backup_firmware['products'][product]['currentVersion']['firmware'] for product in backup_firmware['products'].keys()}
-    prods_in_current = {product:current_firmware['products'][product]['currentVersion']['firmware'] for product in current_firmware['products'].keys()}
-    for key_b in prods_in_backup.keys():
-        for key_c in prods_in_current.keys():
-            if key_b == key_c:
-                if prods_in_backup[key_b]!=prods_in_current[key_c]:
-                    print(f"Firmware version for {key_b} in backup is {prods_in_backup[key_b]} and {prods_in_current[key_c]} in your existing network. Firmware differences can lead to feature incompatibilities and the restore operation failing.")
-                    proceed = input("Do you wish to proceed? (Y/N): ")
-                    if proceed=='Y':
-                        continue
-                    else:
-                        print("Aborted by user.")
-                        sys.exit()
-
-def restoreNetworkGroupPolicies(net, dashboard, path, logger):
-    """
-    Function to restore a network's group policies.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkGroupPolicies", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/group_policies/group_policies.json') as fp:
-            group_policies = json.load(fp)
-            fp.close()
-        operation['restorePayload']=group_policies
-        existing_gps = dashboard.networks.getNetworkGroupPolicies(networkId=net['id'])
-        for policy in group_policies:
-            # CHECK IF POLICIES EXIST ALREADY BEFORE CREATING
-            # IF THEY EXIST, JUST UPDATE
-            update_flag = False
-            for gp in existing_gps:
-                if policy['name'] == gp['name']:
-                    update_flag = True
-                    break
-            if update_flag == True:
-                group_policy_id = policy['groupPolicyId']
-                upd = {k: policy[k] for k in policy.keys() - {'groupPolicyId'}}
-                dashboard.networks.updateNetworkGroupPolicy(networkId=net['id'], groupPolicyId=group_policy_id, **upd)
-            else:
-                name = policy['name']
-                upd = {k: policy[k] for k in policy.keys() - {'name', 'groupPolicyId'}}
-                dashboard.networks.createNetworkGroupPolicy(networkId=net['id'], name=name, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchPortSchedules(net, dashboard, path, logger):
-    """
-    Function to restore a network's switch port group policies.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchPortSchedules", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/port_schedules.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        existing_port_schedules = dashboard.switch.getNetworkSwitchPortSchedules(networkId=net['id'])
-        # CHECK IF PORT SCHEDULE EXISTS
-        # IF IT DOES, JUST UPDATE
-        for schedule in data:
-            update_flag = False
-            for sched in existing_port_schedules:
-                if schedule['name'] == sched['name']:
-                    update_flag = True
-                    port_schedule_id = sched['id']
-                    break
-            if update_flag == True:
-                upd = {k: schedule[k] for k in schedule.keys() - {'id', 'networkId'}}
-                dashboard.switch.updateNetworkSwitchPortSchedule(networkId=net['id'], portScheduleId=port_schedule_id, **upd)
-            else:
-                name = schedule['name']
-                upd = {k: schedule[k] for k in schedule.keys() - {'id', 'networkId', 'name'}}
-                dashboard.switch.createNetworkSwitchPortSchedule(networkId=net['id'], name=name, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchQos(net, dashboard, path, logger):
-    """
-    Function to restore a network's switch qos policies.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchQos", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/qos_rules.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        existing_qos_rules = dashboard.switch.getNetworkSwitchQosRules(networkId=net['id'])
-        # CHECK IF QOS RULE EXISTS
-        # IF IT DOES, DELETE THEN CREATE
-        for rule in existing_qos_rules:
-            dashboard.switch.deleteNetworkSwitchQosRule(networkId=net['id'], qosRuleId=rule['id'])
-        for rule in data:
-            vlan = rule['vlan']
-            upd = {k: rule[k] for k in rule.keys() - {'id', 'vlan'}}
-            if upd['srcPort']==None:
-                del upd['srcPort']
-            if upd['dstPort']==None:
-                del upd['dstPort']
-            dashboard.switch.createNetworkSwitchQosRule(networkId=net['id'], vlan=vlan, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchOspf(net, dashboard, path, logger):
-    """
-    Function to restore a network's switch OSPF settings.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchOspf", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_routing/ospf.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        if data['v3']['enabled']==False:
-            del data['v3']
-        dashboard.switch.updateNetworkSwitchRoutingOspf(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchAccessPolicies(net, dashboard, path, logger):
-    """
-    Function to restore a network's switch access policies.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchAccessPolicies", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/access_policies.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        existing_access_policies = dashboard.switch.getNetworkSwitchAccessPolicies(networkId=net['id'])
-        # CHECK IF ACCESS POLICY EXISTS
-        # IF IT DOES, JUST UPDATE
-        for policy in data:
-            update_flag = False
-            policy_keys = policy.keys()
-            for ap in existing_access_policies:
-                if policy['name'] == ap['name']:
-                    update_flag = True
-                    break
-            if update_flag == True:
-                access_policy_number = policy['accessPolicyNumber']
-                name = policy['name']
-                radius_auth_servers = []
-                if 'radiusServers' in policy_keys:
-                    radius_auth_servers = policy['radiusServers']
-                    for auth_server in radius_auth_servers:
-                        auth_server['secret'] = input(f"Please input your desired RADIUS authentication secret for Access Policy {name} and server {auth_server['host']}: ")
-                if 'radiusAccountingServers' in policy_keys:
-                    radius_acct_servers = policy['radiusAccountingServers']
-                    for acct_server in radius_acct_servers:
-                        acct_server['secret'] = input(f"Please input your desired RADIUS accounting secret for Access Policy {name} and server {acct_server['host']}: ")
-                radius_testing = policy['radiusTestingEnabled']
-                if radius_testing==None:
-                    radius_testing=False
-                radius_coa_support = policy['radiusCoaSupportEnabled']
-                if radius_coa_support==None:
-                    radius_coa_support=False
-                radius_acct_enabled = policy['radiusAccountingEnabled']
-                if radius_acct_enabled==None:
-                    radius_acct_enabled=False
-                host_mode = policy['hostMode']
-                url_redirect_walled_garden_enabled = policy['urlRedirectWalledGardenEnabled']
-                if url_redirect_walled_garden_enabled==None:
-                    url_redirect_walled_garden_enabled=False
-                upd = {k: policy[k] for k in policy.keys() - {
-                    'accessPolicyNumber',
-                    'name',
-                    'radiusServers',
-                    'radiusTestingEnabled',
-                    'radiusCoaSupportEnabled',
-                    'radiusAccountingEnabled',
-                    'hostMode',
-                    'urlRedirectWalledGardenEnabled'
-                }}
-                dashboard.switch.updateNetworkSwitchAccessPolicy(
-                    networkId=net['id'],
-                    accessPolicyNumber=access_policy_number,
-                    name=name,
-                    radiusServers=radius_auth_servers,
-                    radiusTestingEnabled=radius_testing,
-                    radiusCoaSupportEnabled=radius_coa_support,
-                    radiusAccountingEnabled=radius_acct_enabled,
-                    hostMode=host_mode,
-                    urlRedirectWalledGardenEnabled=url_redirect_walled_garden_enabled,
-                    **upd
-                )
-            else:
-                access_policy_number=policy['accessPolicyNumber']
-                name = policy['name']
-                radius_auth_servers = []
-                if 'radiusServers' in policy_keys:
-                    radius_auth_servers = policy['radiusServers']
-                    for auth_server in radius_auth_servers:
-                        auth_server['secret'] = input(f"Please input your desired RADIUS authentication secret for Access Policy {name} and server {auth_server['host']}: ")
-                if 'radiusAccountingServers' in policy_keys:
-                    radius_acct_servers = policy['radiusAccountingServers']
-                    for acct_server in radius_acct_servers:
-                        acct_server['secret'] = input(f"Please input your desired RADIUS accounting secret for Access Policy {name} and server {acct_server['host']}: ")
-                radius_testing = policy['radiusTestingEnabled']
-                if radius_testing == None:
-                    radius_testing = False
-                radius_coa_support = policy['radiusCoaSupportEnabled']
-                if radius_coa_support == None:
-                    radius_coa_support = False
-                radius_acct_enabled = policy['radiusAccountingEnabled']
-                if radius_acct_enabled == None:
-                    radius_acct_enabled = False
-                host_mode = policy['hostMode']
-                url_redirect_walled_garden_enabled = policy['urlRedirectWalledGardenEnabled']
-                if url_redirect_walled_garden_enabled==None:
-                    url_redirect_walled_garden_enabled=False
-                upd = {k: policy[k] for k in policy.keys() - {
-                    'accessPolicyNumber',
-                    'name',
-                    'radiusServers',
-                    'radiusTestingEnabled',
-                    'radiusCoaSupportEnabled',
-                    'radiusAccountingEnabled',
-                    'hostMode',
-                    'urlRedirectWalledGardenEnabled'
-                }}
-                dashboard.switch.createNetworkSwitchAccessPolicy(
-                    networkId=net['id'],
-                    name=name,
-                    radiusServers=radius_auth_servers,
-                    radiusTestingEnabled=radius_testing,
-                    radiusCoaSupportEnabled=radius_coa_support,
-                    radiusAccountingEnabled=radius_acct_enabled,
-                    hostMode=host_mode,
-                    urlRedirectWalledGardenEnabled=url_redirect_walled_garden_enabled,
-                    **upd
-                )
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxVlansBatch(org, net, dashboard, path, logger):
-    """
-    Function to restore a network's MX VLANs.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxVlansBatch", "restorePayload": "","status": ""}
-    try:
-        # Open VLAN settings
-        with open(f'{path}/network/{net["name"]}/appliance/vlans/vlan_config.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        existing_vlans = dashboard.appliance.getNetworkApplianceVlans(networkId=net['id'])
-        actions = []
-        for i in range(len(data)):
-            # Since VLAN 1 always exists in a new config, this must be updated
-            # Trying to create it gives an error
-            if data[i]['id'] == 1:
-                action = {
-                    "resource": f'/networks/{net["id"]}/appliance/vlans/{data[i]["id"]}',
-                    "operation": 'update',
-                    "body": {k: data[i][k] for k in data[i].keys() - {'id', 'networkId'}}
-                }
-                actions.append(action)
-            # For all other VLANs create them
-            # CHECK IF VLANS ALREADY EXIST
-            # IF THEY DO, JUST UPDATE
-            else:
-                update_flag = False
-                for j in range(len(existing_vlans)):
-                    if data[i]['id']==existing_vlans[j]['id']:
-                        update_flag = True
-                        break
-                if update_flag==True:
-                    action = {
-                        "resource": f'/networks/{net["id"]}/appliance/vlans/{data[i]["id"]}',
-                        "operation": 'update',
-                        "body": {k: data[i][k] for k in data[i].keys() - {'id', 'networkId'}}
-                    }
-                    actions.append(action)
-                else:
-                    action = {
-                        "resource": f'/networks/{net["id"]}/appliance/vlans',
-                        "operation": 'create',
-                        "body": {k: data[i][k] for k in data[i].keys() - {'networkId'}}
-                    }
-                    actions.append(action)
-        with open(f'{path}/network/{net["name"]}/appliance/vlans/vlan_ports.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        devices = dashboard.networks.getNetworkDevices(networkId=net['id'])
-        for device in devices:
-            if device['model'] in ['MX64', 'MX64W', 'MX67', 'MX67W', 'MX67C', 'MX100']:
-                starting_port = 2
-            elif 'MX' in device['model']:
-                starting_port = 3
-        model_ports = dashboard.appliance.getNetworkAppliancePorts(networkId=net['id'])
-        # If trying to apply a backup to an MX with fewer ports stop at the last port
-        if len(data) < len(model_ports):
-            logger.info("MX has more ports than backup")
-            for i in range(len(data)):
-                action = {
-                    "resource": f'/networks/{net["id"]}/appliance/ports/{i+starting_port}',
-                    "operation": 'update',
-                    "body": {k: data[i][k] for k in data[i].keys() - {'number'}}
-                }
-                actions.append(action)
-        else:
-            for i in range(len(model_ports)):
-                action = {
-                    "resource": f'/networks/{net["id"]}/appliance/ports/{i+starting_port}',
-                    "operation": 'update',
-                    "body": {k: data[i][k] for k in data[i].keys() - {'number'}}
-                }
-                actions.append(action)
-        operation['restorePayload']=actions
-        # Synchronous batches may only have 20 actions, so need to split actions list in groups of 20
-        # Since we're grouping VLAN creation and port assignment, and port assignment depends on VLANs existing, port
-        # assignment must happen after VLAN creation, hence synchronously
-        if len(actions)<=20:
-            dashboard.organizations.createOrganizationActionBatch(
-                organizationId=org,
-                actions=actions,
-                confirmed=True,
-                synchronous=True
-            )
-        else:
-            for i in range(0, len(actions), 20):
-                subactions = actions[i:i+20]
-                batch = dashboard.organizations.createOrganizationActionBatch(
-                    organizationId=org,
-                    actions=subactions,
-                    confirmed=True,
-                    synchronous=True
-                )
-                time.sleep(1)
-                status = dashboard.organizations.getOrganizationActionBatch(organizationId=org,
-                                                                            actionBatchId=batch['id'])['status']['completed']
-                while status != True:
-                    time.sleep(1)
-                    status = dashboard.organizations.getOrganizationActionBatch(organizationId=org,
-                                                                                actionBatchId=batch['id'])['status']['completed']
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxSecurity(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX AMP and IPS settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxSecurity", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/security/amp.json') as fp:
-            amp_data = json.load(fp)
-            fp.close()
-        with open(f'{path}/network/{net["name"]}/appliance/security/ips.json') as fp:
-            ips_data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=[amp_data, ips_data]
-        dashboard.appliance.updateNetworkApplianceSecurityIntrusion(networkId=net['id'], **ips_data)
-        dashboard.appliance.updateNetworkApplianceSecurityMalware(networkId=net['id'], **amp_data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxFirewall(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX L3 and L7 firewall settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxFirewall", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/security/l3_fw.json') as fp:
-            l3_data = json.load(fp)
-            fp.close()
-        with open(f'{path}/network/{net["name"]}/appliance/security/l7_fw.json') as fp:
-            l7_data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=[l3_data, l7_data]
-        dashboard.appliance.updateNetworkApplianceFirewallL3FirewallRules(networkId=net['id'], **l3_data)
-        dashboard.appliance.updateNetworkApplianceFirewallL7FirewallRules(networkId=net['id'], **l7_data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxContentFiltering(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX Content Filtering settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxContentFiltering", "restorePayload": "","status": ""}
-    try:
-        # Read each config file and apply the config
-        with open(f'{path}/network/{net["name"]}/appliance/security/content_filtering.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        dashboard.appliance.updateNetworkApplianceContentFiltering(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxShaping(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX Shaping settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxShaping", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/shaping/global_shaping.json') as fp:
-            global_data = json.load(fp)
-            fp.close()
-        with open(f'{path}/network/{net["name"]}/appliance/shaping/shaping_rules.json') as fp:
-            rules_data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=[global_data, rules_data]
-        dashboard.appliance.updateNetworkApplianceTrafficShaping(networkId=net['id'], **global_data)
-        dashboard.appliance.updateNetworkApplianceTrafficShapingRules(networkId=net['id'], **rules_data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxVpnConfig(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX VPN settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxVpnConfig", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/vpn_config/vpn_config.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        mode = data['mode']
-        upd = {k: data[k] for k in data.keys() - {'mode'}}
-        dashboard.appliance.updateNetworkApplianceVpnSiteToSiteVpn(networkId=net['id'], mode=mode, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchPortConfigsBatch(org, net, dashboard, path, devices_in_network, logger):
-    """
-    Function to restore a network's Switch Port settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchPortConfigsBatch", "restorePayload": "","status": ""}
-    try:
-        directory = f'{path}/network/{net["name"]}/switch/switch_settings'
-        port_schedules = dashboard.switch.getNetworkSwitchPortSchedules(networkId=net['id'])
-        access_policies = dashboard.switch.getNetworkSwitchAccessPolicies(networkId=net['id'])
-        # For each switch subfolder, read and update port configs
-        actions = []
-        for subdirs, dirs, files in os.walk(directory):
-            for dir in dirs:
-                if dir not in [device['serial'] for device in devices_in_network]:
-                    logger.info(f"Your backup contains switch port configs for {dir}, but this device is not currently in the network.")
-                    logger.info(f"Switch port settings for {dir} will not be restored.")
-                else:
-                    with open(f'{path}/network/{net["name"]}/switch/switch_settings/{dir}/switch_ports.json') as fp:
-                        data = json.load(fp)
-                        fp.close()
-                    for port in data:
-                        upd = port
-                        for schedule in port_schedules:
-                            if schedule['name']==upd['portScheduleId']:
-                                upd['portScheduleId']=schedule['id']
-                        if port['type'] == 'access':
-                            if port['accessPolicyType'] != 'Open':
-                                for policy in access_policies:
-                                    if policy['name'] == port['accessPolicyNumber']:
-                                        upd['accessPolicyNumber']=int(policy['accessPolicyNumber'])
-                        action = {
-                            "resource": f'/devices/{dir}/switch/ports/{upd["portId"]}',
-                            "operation": 'update',
-                            "body": {k: upd[k] for k in upd.keys() - {'portId'}}
-                        }
-                        actions.append(action)
-        operation['restorePayload']=actions
-        for i in range(0, len(actions), 100):
-            subactions = actions[i:i + 100]
-            dashboard.organizations.createOrganizationActionBatch(
-                organizationId=org,
-                actions=subactions,
-                confirmed=True,
-                synchronous=False
-            )
-            time.sleep(1)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreNetworkAlerts(net, dashboard, path, logger):
-    """
-    Function to restore a network's alerts.
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkAlerts", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/alert_settings/alerts.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        dashboard.networks.updateNetworkAlertsSettings(networkId=net['id'], defaultDestinations=data['defaultDestinations'], alerts=data['alerts'])
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreMrSsidConfigs(net, dashboard, path, logger):
-    """
-    Function to restore a network's SSIDs
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrSsidConfigs", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/ssid_settings/ssids.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        current_ssids = dashboard.wireless.getNetworkWirelessSsids(networkId=net['id'])
-        for ssid in current_ssids:
-            print(ssid)
-        operation['restorePayload'] = data
-        for ssid in data:
-            if 'Unconfigured SSID' not in ssid['name']:
-                upd = ssid
-                ssid_number = ssid['number']
-                del upd['number']
-                ssid_keys = upd.keys()
-                if 'authMode' in ssid_keys:
-                    #if ssid['authMode']=='psk':
-                    #    ssid['psk']=input(f"Please input your desired PSK for SSID {ssid['name']}: ")
-                    if ssid['authMode']=='8021x-radius':
-                        if ssid['wpaEncryptionMode']=='WPA3 192-bit Security':
-                            ssid['wpaEncryptionMode']='WPA3 only'
-                        if 'radiusServers' in ssid_keys:
-                            for auth_server in ssid['radiusServers']:
-                                auth_server['secret'] = input(f"Please input your desired RADIUS authentication secret for SSID {ssid['name']} and server {auth_server['host']}: ")
-                        if 'radiusAccountingServers' in ssid_keys:
-                            for acct_server in ssid['radiusAccountingServers']:
-                                acct_server['secret'] = input(f"Please input your desired RADIUS accounting secret for SSID {ssid['name']} and server {acct_server['host']}: ")
-                    if upd['authMode']!='psk' and upd['authMode']!='open':
-                        del upd['encryptionMode']
-                        delete_keys=[]
-                        for key in upd.keys():
-                            if upd[key]==None:
-                                delete_keys.append(key)
-                        for key in delete_keys:
-                            del upd[key]
-                dashboard.wireless.updateNetworkWirelessSsid(networkId=net['id'],number=ssid_number,**upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMrRfProfiles(net, dashboard, path, devices_in_network, logger):
-    """
-    Function to restore a network's RF Profiles
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrRfProfiles", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/radio_settings/rf_profiles.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        existing_profiles = dashboard.wireless.getNetworkWirelessRfProfiles(networkId=net['id'])
-        for rf_profile in data:
-            update_flag = False
-            for profile in existing_profiles:
-                if rf_profile['name']==profile['name']:
-                    update_flag = True
-                    profile_id = profile['id']
-                    profile_name = profile['name']
-                    break
-            if update_flag == True:
-                upd = rf_profile
-                band_selection_type = rf_profile['bandSelectionType']
-                if upd['fiveGhzSettings']['minPower'] < 8:
-                    upd['fiveGhzSettings']['minPower'] = 8
-                    logger.warning('Minimum power configurable for 5GHz via API is 8')
-                if upd['fiveGhzSettings']['maxPower'] > 30:
-                    upd['fiveGhzSettings']['maxPower'] = 30
-                    logger.warning('Maximum power configurable for 5GHz is 30')
-                if upd['twoFourGhzSettings']['minPower'] < 5:
-                    upd['twoFourGhzSettings']['minPower'] = 5
-                    logger.warning('Minimum power configurable for 2.4GHz via API is 5')
-                if upd['twoFourGhzSettings']['maxPower'] > 30:
-                    upd['twoFourGhzSettings']['maxPower'] = 30
-                    logger.warning('Maximum power configurable for 2.4GHz is 30')
-                del upd['id']
-                del upd['networkId']
-                del upd['name']
-                del upd['bandSelectionType']
-                # API endpoint does not support channels 169, 173 and 177
-                upd['fiveGhzSettings']['validAutoChannels']=[channel for channel in upd['fiveGhzSettings']['validAutoChannels'] if channel <= 165]
-                # CHECK IF RF PROFILE ALREADY EXISTS
-                # IF IT DOES, JUST UPDATE
-                dashboard.wireless.updateNetworkWirelessRfProfile(networkId=net['id'], rfProfileId=profile_id,
-                                                                  bandSelectionType=band_selection_type, **upd)
-            else:
-                upd = rf_profile
-                name = rf_profile['name']
-                band_selection_type = rf_profile['bandSelectionType']
-                if upd['fiveGhzSettings']['minPower']<8:
-                    upd['fiveGhzSettings']['minPower']=8
-                    logger.warning('Minimum power configurable for 5GHz via API is 8')
-                if upd['fiveGhzSettings']['maxPower']>30:
-                    upd['fiveGhzSettings']['maxPower']=30
-                    logger.warning('Maximum power configurable for 5GHz is 30')
-                if upd['twoFourGhzSettings']['minPower']<5:
-                    upd['twoFourGhzSettings']['minPower']=5
-                    logger.warning('Minimum power configurable for 2.4GHz via API is 5')
-                if upd['twoFourGhzSettings']['maxPower']>30:
-                    upd['twoFourGhzSettings']['maxPower']=30
-                    logger.warning('Maximum power configurable for 2.4GHz is 30')
-                del upd['id']
-                del upd['networkId']
-                del upd['name']
-                del upd['bandSelectionType']
-                # CHECK IF RF PROFILE ALREADY EXISTS
-                # IF IT DOES, JUST UPDATE
-                # API endpoint does not support channels 169, 173 and 177
-                upd['fiveGhzSettings']['validAutoChannels']=[channel for channel in upd['fiveGhzSettings']['validAutoChannels'] if channel <= 165]
-                dashboard.wireless.createNetworkWirelessRfProfile(networkId=net['id'], name=name, bandSelectionType=band_selection_type, **upd)
-        rf_profiles = dashboard.wireless.getNetworkWirelessRfProfiles(networkId=net['id'])
-        with open(f'{path}/network/{net["name"]}/wireless/radio_settings/radio_settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        for setting in data:
-            if setting['serial'] in [device['serial'] for device in devices_in_network]:
-                if 'profileName' in setting.keys():
-                    upd = setting
-                    serial = setting['serial']
-                    for profile in rf_profiles:
-                        if profile['name']==upd['profileName']:
-                            upd['rfProfileId'] = profile['id']
-                    del upd['serial']
-                    dashboard.wireless.updateDeviceWirelessRadioSettings(serial=serial, **upd)
-                else:
-                    logger.info(f"Your backup contains radio settings for device {setting['serial']} but this device was not found in your network.")
-                    logger.info("Settings for this device will not be restored.")
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMrSsidFW(net, dashboard, path, logger):
-    """
-    Function to restore a network's SSID FW
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrSsidFW", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/ssid_settings/l7_rules.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=[data]
-        for ssid in data:
-            upd = ssid
-            ssid_number = ssid['number']
-            del upd['number']
-            dashboard.wireless.updateNetworkWirelessSsidFirewallL7FirewallRules(networkId=net['id'], number=ssid_number, **upd)
-        with open(f'{path}/network/{net["name"]}/wireless/ssid_settings/l3_rules.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'].append(data)
-        for ssid in data:
-            ssid_rules = [rule for rule in ssid['rules'] if (rule['destCidr']!='Local LAN' and rule['comment']!='Default rule')]
-            upd = ssid
-            upd['rules']=ssid_rules
-            ssid_number = ssid['number']
-            del upd['number']
-            dashboard.wireless.updateNetworkWirelessSsidFirewallL3FirewallRules(networkId=net['id'], number=ssid_number, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMrSsidShaping(net, dashboard, path, logger):
-    """
-    Function to restore a network's SSID shaping
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrSsidFW", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/ssid_settings/shaping_rules.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        for ssid in data:
-            upd = ssid
-            ssid_number = ssid['number']
-            del upd['number']
-            dashboard.wireless.updateNetworkWirelessSsidTrafficShapingRules(networkId=net['id'], number=ssid_number, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchSvis(net, dashboard, path, devices_in_network, logger):
-    """
-    Function to restore a network's Switch SVIs
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchSvis", "restorePayload": "","status": ""}
-    try:
-        directory = f'{path}/network/{net["name"]}/switch/switch_routing'
-        # For each switch subfolder, read and update svi configs
-        for subdirs, dirs, files in os.walk(directory):
-            for dir in dirs:
-                if dir not in [device['serial'] for device in devices_in_network]:
-                    logger.info(f"Your backup contains SVI configs for {dir}, but this device is not currently in the network.")
-                    logger.info(f"SVI settings for {dir} will not be restored.")
-                else:
-                    if ('svi_dhcp.json' and 'svis.json') in next(os.walk(f"{path}/network/{net['name']}/switch/switch_routing/{dir}"))[2]:
-                        #Load SVI configs into svis variable
-                        with open(f'{path}/network/{net["name"]}/switch/switch_routing/{dir}/svis.json') as fp:
-                            svis = json.load(fp)
-                            fp.close()
-                        existing_svis = dashboard.switch.getDeviceSwitchRoutingInterfaces(serial=dir)
-                        #Load SVI DHCP configs into svi_dhcps variable
-                        with open(f'{path}/network/{net["name"]}/switch/switch_routing/{dir}/svi_dhcp.json') as fp:
-                            svi_dhcps = json.load(fp)
-                            fp.close()
-                        #Iterate through SVIs in svi list
-                        for svi in svis:
-                            update_flag = False
-                            for existing_svi in existing_svis:
-                                if svi['name'] == existing_svi['name']:
-                                    update_flag = True
-                                    interface_id = existing_svi['interfaceId']
-                                    break
-                            if update_flag == True:
-                                svi_name = svi['name']
-                                interface_ip = svi['interfaceIp']
-                                vlan_id = svi['vlanId']
-                                upd = {k: svi[k] for k in svi.keys() - {'name', 'interfaceIp', 'vlanId', 'interfaceId', 'defaultGateway'}}
-                                # create SVI
-                                # CHECK IF SVI EXISTS
-                                # IF IT DOES, JUST UPDATE
-                                new_id = dashboard.switch.updateDeviceSwitchRoutingInterface(serial=dir, interfaceId=interface_id,
-                                                                                             name=svi_name,
-                                                                                             interfaceIp=interface_ip,
-                                                                                             vlanId=vlan_id, **upd)
-                                # Update DHCP settings of SVI
-                                for i in range(len(svi_dhcps)):
-                                    if svi_dhcps[i]['interfaceId'] == interface_id:
-                                        upd_dhcp = svi_dhcps[i]
-                                        del upd_dhcp['interfaceId']
-                                        dashboard.switch.updateDeviceSwitchRoutingInterfaceDhcp(serial=dir,
-                                                                                                interfaceId=new_id['interfaceId'],
-                                                                                                **upd_dhcp)
-                                        pop = i
-                                # Remove used SVI DHCP entry to avoid in next iteration
-                                svi_dhcps.pop(pop)
-                            else:
-                                svi_name = svi['name']
-                                interface_ip = svi['interfaceIp']
-                                vlan_id = svi['vlanId']
-                                interface_id = svi['interfaceId']
-                                upd = {k: svi[k] for k in svi.keys() - {'name','interfaceIp','vlanId','interfaceId'}}
-                                #create SVI
-                                # CHECK IF SVI EXISTS
-                                # IF IT DOES, JUST UPDATE
-                                print(upd)
-                                new_id = dashboard.switch.createDeviceSwitchRoutingInterface(serial=dir, name=svi_name, interfaceIp=interface_ip, vlanId=vlan_id, **upd)
-                                #Update DHCP settings of SVI
-                                for i in range(len(svi_dhcps)):
-                                    if svi_dhcps[i]['interfaceId']==interface_id:
-                                        upd_dhcp = svi_dhcps[i]
-                                        del upd_dhcp['interfaceId']
-                                        dashboard.switch.updateDeviceSwitchRoutingInterfaceDhcp(serial=dir, interfaceId=new_id['interfaceId'],
-                                                                                                **upd_dhcp)
-                                        pop=i
-                                #Remove used SVI DHCP entry to avoid in next iteration
-                                svi_dhcps.pop(pop)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxStaticRouting(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX Static Routes
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxStaticRouting", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/appliance_routing/static_routes.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        existing_routes = dashboard.appliance.getNetworkApplianceStaticRoutes(networkId=net['id'])
-        # CHECK IF ROUTE EXISTS
-        # IF IT DOES, JUST UPDATE
-        for route in data:
-            update_flag = False
-            for existing_route in existing_routes:
-                if route['name']==existing_route['name']:
-                    update_flag = True
-                    route_id = existing_route['id']
-                    break
-            if update_flag == True:
-                dashboard.appliance.updateNetworkApplianceStaticRoute(networkId=net['id'], staticRouteId=route_id, name=route['name'], subnet=route['subnet'], gatewayIp=route['gatewayIp'])
-            else:
-                dashboard.appliance.createNetworkApplianceStaticRoute(networkId=net['id'], name=route['name'], subnet=route['subnet'], gatewayIp=route['gatewayIp'])
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreSwitchDhcpSecurity(net, dashboard, path, logger):
-    """
-    Function to restore a network's Switch DHCP Security
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreMxVpnConfig", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/dhcp_policies.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload']=data
-        dashboard.switch.updateNetworkSwitchDhcpServerPolicy(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxSdWanSettings(net, dashboard, path, logger):
-    """
-    Function to restore a network's MX VPN settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxSdWanSettings", "restorePayload": "","status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/sdwan_settings/perf_classes.json') as fp:
-            perf_classes = json.load(fp)
-            fp.close()
-        existing_perf_classes = dashboard.appliance.getNetworkApplianceTrafficShapingCustomPerformanceClasses(networkId=net['id'])
-        with open(f'{path}/network/{net["name"]}/appliance/sdwan_settings/uplink_bandwidth.json') as fp:
-            uplink_bw = json.load(fp)
-            fp.close()
-        with open(f'{path}/network/{net["name"]}/appliance/sdwan_settings/uplink_selection.json') as fp:
-            uplink_selection = json.load(fp)
-            fp.close()
-        operation['restorePayload']=[perf_classes, uplink_bw, uplink_selection]
-        dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkBandwidth(networkId=net['id'], **uplink_bw)
-        for perf in perf_classes:
-            update_flag = False
-            for perf_class in existing_perf_classes:
-                if perf['name']==perf_class['name']:
-                    update_flag = True
-                    perf_class_id = perf_class['customPerformanceClassId']
-                    break
-            if update_flag==True:
-                upd = perf
-                name = perf['name']
-                old_id = upd['customPerformanceClassId']
-                del upd['name']
-                del upd['customPerformanceClassId']
-                # CHECK IF PERFORMANCE CLASS EXISTS
-                # IF IT DOES, JUST UPDATE
-                new_id = dashboard.appliance.updateNetworkApplianceTrafficShapingCustomPerformanceClass(networkId=net['id'],
-                                                                                                        customPerformanceClassId=perf_class_id,
-                                                                                                        name=name,
-                                                                                                        **upd)
-                perf['newId'] = perf_class_id
-                perf['oldId'] = old_id
-            else:
-                upd = perf
-                name = perf['name']
-                old_id = upd['customPerformanceClassId']
-                del upd['name']
-                del upd['customPerformanceClassId']
-                # CHECK IF PERFORMANCE CLASS EXISTS
-                # IF IT DOES, JUST UPDATE
-                new_id = dashboard.appliance.createNetworkApplianceTrafficShapingCustomPerformanceClass(networkId=net['id'], name=name,
-                                                                                               **upd)
-                perf['newId']=new_id['customPerformanceClassId']
-                perf['oldId']=old_id
-        for i in range(len(uplink_selection["vpnTrafficUplinkPreferences"])):
-            if uplink_selection["vpnTrafficUplinkPreferences"][i]['preferredUplink']!='bestForVoIP' and uplink_selection["vpnTrafficUplinkPreferences"][i]!='defaultUplink':
-                for perf in perf_classes:
-                    if perf['oldId']==uplink_selection["vpnTrafficUplinkPreferences"][i]['performanceClass']['customPerformanceClassId']:
-                        uplink_selection["vpnTrafficUplinkPreferences"][i]['performanceClass']['customPerformanceClassId']=perf['newId']
-        dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkSelection(networkId=net['id'], **uplink_selection)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreNetworkWebhooks(net, dashboard, path, logger):
-    """
-    Restore Network Webhooks
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkWebhooks",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/webhooks/webhooks_servers.json') as fp:
-            webhook_data = json.load(fp)
-            fp.close()
-        with open(f'{path}/network/{net["name"]}/webhooks/webhooks_payload_templates.json') as fp:
-            webhook_template_data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = [webhook_data, webhook_template_data]
-        existing_webhook_payloads = dashboard.networks.getNetworkWebhooksPayloadTemplates(networkId=net['id'])
-        backup_wt_set = set(wt['name'] for wt in webhook_template_data)
-        net_wt_set = set(wt['name'] for wt in existing_webhook_payloads)
-        to_create = backup_wt_set.difference(net_wt_set)
-        to_update = backup_wt_set.difference(to_create)
-
-        # Construct list of Webhook Templates to be created and updated based on the result of the previous set operation
-        create_wt = [wt for wt in webhook_template_data if (wt['name'] in to_create and wt['type']!='included')]
-        update_wt = [wt for wt in webhook_template_data if (wt['name'] in to_update and wt['type']!='included')]
-
-        for wt in create_wt:
-            name = wt['name']
-            upd = {k: wt[k] for k in wt.keys() - {'id', 'networkId', 'name'}}
-            dashboard.networks.createNetworkWebhooksPayloadTemplate(networkId=net['id'], name=name, **upd)
-
-        for wt in update_wt:
-            wt_id = wt['id']
-            upd = {k: wt[k] for k in wt.keys() - {'id', 'networkId'}}
-            dashboard.networks.updateNetworkWebhooksPayloadTemplate(networkId=net['id'],
-                                                                    payloadTemplateId=wt_id, **upd)
-
-        new_webhook_payloads = dashboard.networks.getNetworkWebhooksPayloadTemplates(networkId=net['id'])
-
-        existing_webhook_servers = dashboard.networks.getNetworkWebhooksHttpServers(networkId=net['id'])
-        backup_ws_set = set(ws['name'] for ws in webhook_data)
-        net_ws_set = set(ws['name'] for ws in existing_webhook_servers)
-        to_create = backup_ws_set.difference(net_ws_set)
-        to_update = backup_ws_set.difference(to_create)
-
-        # Construct list of Webhook Servers to be created and updated based on the result of the previous set operation
-        create_ws = [ws for ws in webhook_data if (ws['name'] in to_create)]
-        for ws in create_ws:
-            for wt in new_webhook_payloads:
-                if ws['payloadTemplate']['name']==wt['name']:
-                    ws['payloadTemplate']['payloadTemplateId']=wt['id']
-            name = ws['name']
-            url = ws['url']
-            upd = {k: ws[k] for k in ws.keys() - {'id', 'networkId', 'name', 'url'}}
-            dashboard.networks.createNetworkWebhooksHttpServer(networkId=net['id'], name=name, url=url, **upd)
-        update_ws = [ws for ws in webhook_data if (ws['name'] in to_update)]
-        for ws in update_ws:
-            for wt in new_webhook_payloads:
-                if ws['payloadTemplate']['name']==wt['name']:
-                    ws['payloadTemplate']['payloadTemplateId']=wt['payloadTemplateId']
-            ws_id = ws['id']
-            upd = {k: ws[k] for k in ws.keys() - {'id', 'networkId'}}
-            dashboard.networks.updateNetworkWebhooksHttpServer(networkId=net['id'], httpServerId=ws_id,
-                                                               **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreNetworkSyslog(net, dashboard, path, logger):
-    """
-    Restore Network Syslog
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkSyslog",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/syslog/syslog.json') as fp:
-            syslog_data = json.load(fp)
-            fp.close()
-        dashboard.networks.updateNetworkSyslogServers(networkId=net['id'], servers=syslog_data['servers'])
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreNetworkSnmp(net, dashboard, path, logger):
-    """
-    Restore Network SNMP
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkSnmp",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/snmp/snmp.json') as fp:
-            snmp_data = json.load(fp)
-            fp.close()
-        dashboard.networks.updateNetworkSnmp(networkId=net['id'], **snmp_data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreNetworkFloorplans(net, dashboard, path, logger):
-    """
-    Restore Network Floorplans
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkFloorplans",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/floorplans/floorplans.json') as fp:
-            floorplans_in_backup = json.load(fp)
-            fp.close()
-        current_floorplans = dashboard.networks.getNetworkFloorPlans(networkId=net['id'])
-
-        backup_fp_set = set(fp['name'] for fp in floorplans_in_backup)
-        net_fp_set = set(fp['name'] for fp in current_floorplans)
-        to_create = backup_fp_set.difference(net_fp_set)
-        to_update = backup_fp_set.difference(to_create)
-
-        # Construct list of Policy Objects to be created and updated based on the result of the previous set operation
-        create_fp = [fp for fp in floorplans_in_backup if (fp['name'] in to_create)]
-        update_fp = [fp for fp in floorplans_in_backup if (fp['name'] in to_update)]
-
-        for fp in create_fp:
-            with open(f'{path}/network/{net["name"]}/floorplans/{fp["name"]}.png', 'rb') as fp_file:
-                encoded_string = base64.b64encode(fp_file.read()).decode('utf-8')
-            name = fp['name']
-            upd = {k: fp[k] for k in fp.keys() - {'floorPlanId', 'name', 'devices', 'imageUrl', 'imageMd5', 'imageExtension', 'imageExpiresAt'}}
-            dashboard.networks.createNetworkFloorPlan(networkId=net['id'], name=name, imageContents=encoded_string, **upd)
-
-        for fp in update_fp:
-            with open(f'{path}/network/{net["name"]}/floorplans/{fp["name"]}.png', 'rb') as fp_file:
-                encoded_string = base64.b64encode(fp_file.read()).decode('utf-8')
-            for cfp in current_floorplans:
-                if cfp['name']==fp['name']:
-                    fp['floorPlanId']=cfp['floorPlanId']
-            fp_id = fp['floorPlanId']
-            upd = {k: fp[k] for k in fp.keys() - {'floorPlanId', 'devices', 'imageUrl', 'imageMd5', 'imageExtension', 'imageUrlExpiresAt'}}
-            upd['imageContents']=encoded_string
-            dashboard.networks.updateNetworkFloorPlan(networkId=net['id'], floorPlanId=fp_id, **upd)
-
-        # Floorplan IDs may differ from backup if you had to create any of them during the restore operation
-        # This section makes sure to update the appropriate IDs for reference during Device placement
-        with open(f'{path}/network/{net["name"]}/floorplans/floorplans.json') as fp:
-            original_floorplans_in_backup = json.load(fp)
-            fp.close()
-        final_floorplans = dashboard.networks.getNetworkFloorPlans(networkId=net['id'])
-        for bfp in original_floorplans_in_backup:
-            for ffp in final_floorplans:
-                if bfp['name']==ffp['name']:
-                    bfp['newFloorPlanId']=ffp['floorPlanId']
-        ffp=original_floorplans_in_backup
-
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        ffp=[]
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        ffp=[]
-        logger.error(e)
-        operation["status"]=e
-    return operation, ffp
-
-def restoreNetworkDevices(net, org, devices_in_network, dashboard, path, updated_floorplans, logger):
-    """
-    Restore Network Device settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "network", "operation": "restoreNetworkDevices",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/devices/network_devices.json') as fp:
-            devices_in_backup = json.load(fp)
-            fp.close()
-        backup_set = set([device['serial'] for device in devices_in_backup])
-        current_set = set([device['serial'] for device in devices_in_network])
-        devices_not_in_network = backup_set - current_set
-        if devices_not_in_network != set():
-            print(f"Network {net['name']} is missing the following devices that were part of your last backup:")
-            missing_devices = [device for device in devices_in_backup if device['serial'] in devices_not_in_network]
-            for device in missing_devices:
-                print(device)
-            print("Settings assigned to the missing devices will not be restored, and will be omitted in future tasks of the restore job.")
-            proceed = input("Do you wish to continue? (Y/N)")
-            if proceed != 'Y':
-                print("Aborted by user.")
-                sys.exit()
-        intersection_set = backup_set.intersection(current_set)
-        devices_to_update = [device for device in devices_in_backup if device['serial'] in intersection_set]
-        actions = []
-        # Floorplans IDs may have changed after restoring floorplans, if any floorplans had to be re-created
-        # If the updated_floorplans is not an empty array, make sure to use the newFloorPlanId for updating the device
-        # Otherwise disregard floorPlanId field
-        if updated_floorplans !=[]:
-            for device in devices_to_update:
-                if 'floorPlanId' in device.keys():
-                    for fp in updated_floorplans:
-                        if fp['floorPlanId']==device['floorPlanId']:
-                            device['floorPlanId']=fp['newFloorPlanId']
-                            action = {
-                                "resource": f'/devices/{device["serial"]}',
-                                "operation": 'update',
-                                "body": {k: device[k] for k in device.keys() - {'serial', 'elevationUncertainty', 'switchProfileId'}}
-                            }
-                            actions.append(action)
-                else:
-                    action = {
-                        "resource": f'/devices/{device["serial"]}',
-                        "operation": 'update',
-                        "body": {k: device[k] for k in
-                                 device.keys() - {'serial', 'elevationUncertainty', 'switchProfileId'}}
-                    }
-                    actions.append(action)
-            operation['restorePayload']=actions
-        else:
-            for device in devices_to_update:
-                action = {
-                    "resource": f'/devices/{device["serial"]}',
-                    "operation": 'update',
-                    "body": {k: device[k] for k in device.keys() - {'serial', 'elevationUncertainty', 'switchProfileId', 'floorPlanId'}}
-                }
-                actions.append(action)
-            operation['restorePayload']=actions
-        if len(actions)<=100:
-            dashboard.organizations.createOrganizationActionBatch(
-                organizationId=org,
-                actions=actions,
-                confirmed=True,
-                synchronous=False
-            )
-        else:
-            for i in range(0, len(actions), 100):
-                subactions = actions[i:i+100]
-                batch = dashboard.organizations.createOrganizationActionBatch(
-                    organizationId=org,
-                    actions=subactions,
-                    confirmed=True,
-                    synchronous=False
-                )
-                time.sleep(1)
-                status = dashboard.organizations.getOrganizationActionBatch(organizationId=org,
-                                                                            actionBatchId=batch['id'])['status']['completed']
-                while status != True:
-                    time.sleep(1)
-                    status = dashboard.organizations.getOrganizationActionBatch(organizationId=org,
-                                                                                actionBatchId=batch['id'])['status']['completed']
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation, devices_to_update
-
-def restoreSwitchStp(net, dashboard, path, logger):
-    """
-    Restore STP Settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchStp",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/switch_stp.json') as fp:
-            backup_stp = json.load(fp)
-            fp.close()
-        switches_in_backup = []
-        current_switches = []
-        current_stp = dashboard.switch.getNetworkSwitchStp(networkId=net['id'])
-        for priority in backup_stp['stpBridgePriority']:
-            if 'switches' in priority.keys():
-                for switch in priority['switches']:
-                    switches_in_backup.append(switch)
-            if 'stacks' in priority.keys():
-                for stack in priority['stacks']:
-                    switches_in_backup.append(stack)
-        for priority in current_stp['stpBridgePriority']:
-            if 'switches' in priority.keys():
-                for switch in priority['switches']:
-                    current_switches.append(switch)
-            if 'stacks' in priority.keys():
-                for stack in priority['stacks']:
-                    current_switches.append(stack)
-
-        if switches_in_backup != current_switches:
-            logger.info("Switches in backup don't match switches in network. Skipping STP restore.")
-            operation['status']="Switches in backup don't match switches in network. Skipping STP restore."
-        else:
-            dashboard.switch.updateNetworkSwitchStp(networkId=net['id'], **backup_stp)
-            operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchAcl(net, dashboard, path, logger):
-    """
-    Restore Switch ACL
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchAcl",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/switch_acl.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        rules = [rule for rule in data['rules'] if rule['comment']!='Default rule']
-        operation['restorePayload']=data
-        dashboard.switch.updateNetworkSwitchAccessControlLists(networkId=net['id'], rules=rules)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreOrganizationMxVpnFirewall(org, dashboard, path, logger):
-    """
-    Restore Organization VPN Firewall
-    :param org: target organization
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": "Organization", "operation_type": "organization", "operation": "restoreOrganizationVpnFirewall",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(
-                f'{path}/organization/vpn_firewall/vpn_firewall.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.appliance.updateOrganizationApplianceVpnVpnFirewallRules(organizationId=org, **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreOrganizationMxIpsecVpn(org, dashboard, path, logger):
-    """
-    Restore Organization IPsec VPN
-    :param org: target organization
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": "Organization", "operation_type": "organization",
-                 "operation": "restoreOrganizationIpsecVpn",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(
-                f'{path}/organization/ipsec_vpn/ipsec_vpn.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        # Note, only
-        dashboard.appliance.updateOrganizationApplianceVpnThirdPartyVPNPeers(organizationId=org, peers=data['peers'])
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreSwitchSettings(net, dashboard, path, logger):
-    """
-    Restore Switch Network Settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreSwitchSettings",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(
-                f'{path}/network/{net["name"]}/switch/switch_settings/switch_settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.switch.updateNetworkSwitchSettings(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchMtu(net, dashboard, path, logger):
-    """
-    Restore Switch MTU
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreSwitchMtu",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(
-                f'{path}/network/{net["name"]}/switch/switch_settings/switch_mtu.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.switch.updateNetworkSwitchMtu(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMrWirelessSettings(net, dashboard, path, logger):
-    """
-    Restore MR Network Wireless Settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrWirelessSettings",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/network_wireless_settings/network_wireless_settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.wireless.updateNetworkWirelessSettings(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMxBgp(net, dashboard, path, logger):
-    """
-    Restore MX BGP
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "appliance", "operation": "restoreMxBgp",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/appliance/appliance_routing/bgp.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        enabled=data['enabled']
-        upd = {k:data[k] for k in data.keys() - {"enabled"}}
-        operation['restorePayload'] = data
-        dashboard.appliance.updateNetworkApplianceVpnBgp(networkId=net['id'], enabled=enabled, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreSwitchLinkAgg(net, dashboard, path, devices_in_network, logger):
-    """
-    Restore Switch Link Agg Groups
-    This function will:
-    1. Check if the backup switches match the current switches in the network
-    2. If this check is successful, it will delete all current link aggregations, and create new ones based on the
-    backup
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchLinkAgg",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/switch_link_aggregations.json') as fp:
-            backup_link_aggs = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = backup_link_aggs
-        current_link_aggs = dashboard.switch.getNetworkSwitchLinkAggregations(networkId=net['id'])
-        switches_in_backup_preproc = []
-        for la in backup_link_aggs:
-            for port in la['switchPorts']:
-                switches_in_backup_preproc.append(port['serial'])
-        switches_in_backup = set(switches_in_backup_preproc)
-        current_switches_preproc = []
-        for la in current_link_aggs:
-            for port in la['switchPorts']:
-                current_switches_preproc.append(port['serial'])
-        current_switches = set(switches_in_backup_preproc)
-        non_intersection = switches_in_backup.difference(current_switches)
-        if non_intersection != set():
-            logger.error("Switches in backup do not match switches currently in network. Link aggregations will not be restored.")
-            logger.debug(f"Switches in backup: {switches_in_backup}")
-            logger.debug(f"Current switches: {current_switches}")
-        else:
-            proceed = input("Current link aggregations will be deleted, and recreated according to backup. Do you wish to continue? (Y/N): ")
-            if proceed == 'Y':
-                for la in current_link_aggs:
-                    dashboard.switch.deleteNetworkSwitchLinkAggregation(networkId=net['id'], linkAggregationId=la['id'])
-                for la in backup_link_aggs:
-                    upd = {k:la[k] for k in la.keys() - {'id'}}
-                    dashboard.switch.createNetworkSwitchLinkAggregation(networkId=net['id'], **upd)
-            else:
-                logger.error("Link aggregation restore aborted by user.")
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreOrganizationPolicyObjects(org, dashboard, path, logger):
-    """
-    Restore Organization Policy Objects
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": "Organization", "operation_type": "organization", "operation": "restoreOrganizationPolicyObjects",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/organization/policy_objects/policy_objects.json') as fp:
-            policy_object_data = json.load(fp)
-            fp.close()
-        with open(f'{path}/organization/policy_objects/policy_objects_groups.json') as fp:
-            policy_objects_groups_data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = [policy_object_data, policy_objects_groups_data]
-
-        existing_policy_objects = dashboard.organizations.getOrganizationPolicyObjects(organizationId=org, total_pages=-1)
-        backup_po_set = set(po['name'] for po in policy_object_data)
-        net_po_set = set(po['name'] for po in existing_policy_objects)
-        to_create = backup_po_set.difference(net_po_set)
-        to_update = backup_po_set.difference(to_create)
-
-        # Construct list of Policy Objects to be created and updated based on the result of the previous set operation
-        create_po = [po for po in policy_object_data if (po['name'] in to_create)]
-        update_po = [po for po in policy_object_data if (po['name'] in to_update)]
-
-        for po in create_po:
-            name = po['name']
-            category=po['category']
-            type=po['type']
-            upd = {k: po[k] for k in po.keys() - {'id', 'name', 'category', 'type', 'groupIds', 'networkIds'}}
-            dashboard.organizations.createOrganizationPolicyObject(organizationId=org, name=name, category=category, type=type,**upd)
-
-        for po in update_po:
-            po_id = po['id']
-            upd = {k: po[k] for k in po.keys() - {'id', 'groupIds', 'networkIds'}}
-            dashboard.organizations.updateOrganizationPolicyObject(organizationId=org, policyObjectId=po_id, **upd)
-
-
-        new_pos = dashboard.organizations.getOrganizationPolicyObjects(organizationId=org, total_pages=-1)
-
-        existing_policy_objects_groups = dashboard.organizations.getOrganizationPolicyObjectsGroups(organizationId=org, total_pages=-1)
-        backup_pog_set = set(pog['name'] for pog in policy_objects_groups_data)
-        net_pog_set = set(pog['name'] for pog in existing_policy_objects_groups)
-        to_create = backup_pog_set.difference(net_pog_set)
-        to_update = backup_pog_set.difference(to_create)
-
-        # Construct list of Policy Object Groups to be created and updated based on the result of the previous set operation
-        create_pog = [pog for pog in policy_objects_groups_data if (pog['name'] in to_create)]
-        update_pog = [pog for pog in policy_objects_groups_data if (pog['name'] in to_update)]
-
-        for pog in create_pog:
-            new_object_ids=[]
-            for o_id in pog['objectIds']:
-                for obj in policy_object_data:
-                    if obj['id']==o_id:
-                        for new_object in new_pos:
-                            if new_object['name']==obj['name']:
-                                new_object_ids.append(new_object['id'])
-            pog['objectIds']=new_object_ids
-            name = pog['name']
-            upd = {k: pog[k] for k in pog.keys() - {'id', 'name', 'networkIds'}}
-            dashboard.organizations.createOrganizationPolicyObjectsGroup(organizationId=org, name=name, **upd)
-
-        for pog in update_pog:
-            new_object_ids=[]
-            for o_id in pog['objectIds']:
-                for obj in policy_object_data:
-                    if obj['id']==o_id:
-                        for new_object in new_pos:
-                            if new_object['name']==obj['name']:
-                                new_object_ids.append(new_object['id'])
-            pog_id = pog['id']
-            upd = {k: pog[k] for k in pog.keys() - {'id', 'networkIds'}}
-            dashboard.organizations.updateOrganizationPolicyObjectsGroup(organizationId=org, policyObjectGroupId=pog_id, **upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreMrBluetooth(net, dashboard, path, devices_in_network, logger):
-    """
-    Restore MR Bluetooth settings
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "wireless", "operation": "restoreMrBluetooth",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/wireless/bluetooth_settings/network_bluetooth_settings.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.wireless.updateNetworkWirelessBluetoothSettings(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreSwitchStaticRouting(net, dashboard, path, devices_in_network, logger):
-    """
-    Function to restore a network's Switch Static Routing
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchStaticRouting", "restorePayload": "",
-                 "status": ""}
-    try:
-        directory = f'{path}/network/{net["name"]}/switch/switch_routing'
-        # For each switch subfolder, read and update Static Route configs
-        for subdirs, dirs, files in os.walk(directory):
-            for dir in dirs:
-                if dir not in [device['serial'] for device in devices_in_network]:
-                    logger.info(
-                        f"Your backup contains static routes for {dir}, but this device is not currently in the network.")
-                    logger.info(f"Static route settings for {dir} will not be restored.")
-                else:
-                    if 'static_routes.json' in \
-                            next(os.walk(f"{path}/network/{net['name']}/switch/switch_routing/{dir}"))[2]:
-                        # Load SVI configs into svis variable
-                        with open(f'{path}/network/{net["name"]}/switch/switch_routing/{dir}/static_routes.json') as fp:
-                            routes = json.load(fp)
-                            fp.close()
-                        existing_routes = dashboard.switch.getDeviceSwitchRoutingStaticRoutes(serial=dir)
-                        # Iterate through routes in route list
-                        for route in routes:
-                            update_flag = False
-                            for existing_route in existing_routes:
-                                if route['name'] == existing_route['name']:
-                                    update_flag = True
-                                    route_id = existing_route['staticRouteId']
-                                    break
-                            if update_flag == True:
-                                route_name = route['name']
-                                upd = {k: route[k] for k in route.keys() - {'staticRouteId'}}
-                                new_id = dashboard.switch.updateDeviceSwitchRoutingStaticRoute(serial=dir,
-                                                                                      staticRouteId=route_id, **upd)
-
-                            else:
-                                route_name = route['name']
-                                subnet=route['subnet']
-                                next_hop_ip=route['nextHopIp']
-                                upd = {k: route[k] for k in route.keys() - {'name', 'subnet', 'nextHopIp'}}
-                                new_id = dashboard.switch.createDeviceSwitchRoutingStaticRoute(serial=dir, subnet=subnet, nextHopIp=next_hop_ip,**upd)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-def restoreSwitchStormControl(net, dashboard, path, logger):
-    """
-    Restore Switch Storm Control
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchStormControl",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/switch_storm_control.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.switch.updateNetworkSwitchStormControl(networkId=net['id'], **data)
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-def restoreSwitchDscpCosMap(net, dashboard, path, logger):
-    """
-    Restore Switch DSCP to COS Map
-    :param net: target network
-    :param dashboard: Meraki API client
-    :param path: Backup location
-    :return:
-    """
-    operation = {"network": net, "operation_type": "switch", "operation": "restoreSwitchDscpCosMap",
-                 "restorePayload": "", "status": ""}
-    try:
-        with open(f'{path}/network/{net["name"]}/switch/switch_settings/switch_dscp_cos.json') as fp:
-            data = json.load(fp)
-            fp.close()
-        operation['restorePayload'] = data
-        dashboard.switch.updateNetworkSwitchDscpToCosMappings(networkId=net['id'], mappings=data['mappings'])
-        operation['status'] = "Complete"
-    except meraki.APIError as e:
-        logger.error(e)
-        operation['status'] = e
-    except Exception as e:
-        logger.error(e)
-        operation["status"]=e
-    return operation
-
-
-
-### Retired functions
-
-def restoreVlans(net, dashboard, path, logger):
-    """Function for restoring VLAN configs"""
-
-    # Open VLAN settings
-    with open(f'{path}/network/{net["name"]}/appliance/vlans/vlan_config.json') as fp:
-        data = json.load(fp)
-        fp.close()
-    for i in range(len(data)):
-        # Since VLAN 1 always exists in a new config, this must be updated
-        # Trying to create it gives an error
+import json
+import re
+import ipaddress
+from urllib.parse import urlparse
+
+
+# ==============================
+# 🔧 HELPER: LOAD JSON SAFE
+# ==============================
+def load_json_safe(file_path):
+    if not os.path.exists(file_path):
+        print(f"[RESTORE SKIP] File not found: {file_path}")
+        return None
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ==============================
+# 📡 RESTORE SSIDs (MR)
+# ==============================
+def restoreSsids(network_id, network_folder, dashboard):
+    ssids_file = os.path.join(
+        network_folder,
+        "ssids",
+        "ssids.json"
+    )
+
+    print(f"[RESTORE] Looking for SSID file: {ssids_file}")
+
+    ssids = load_json_safe(ssids_file)
+    if not ssids:
+        return
+
+    print(f"[RESTORE] Found {len(ssids)} SSIDs in snapshot")
+
+    for ssid in ssids:
         try:
-            if data[i]['groupPolicyId']:
-                logger.info('VLAN has a Group Policy')
-                if data[i]['id'] == 1:
-                    dashboard.appliance.updateNetworkApplianceVlan(
-                        applianceIp=data[i]['applianceIp'],
-                        vlanId=data[i]['id'],
-                        name=data[i]['name'],
-                        networkId=net['id'],
-                        subnet=data[i]['subnet'],
-                        groupPolicyId=data[i]['groupPolicyId']
-                    )
-                # For all other VLANs create them
-                # CHECK IF VLAN ALREADY EXISTS
-                # IF THEY DO, JUST UPDATE
-                else:
-                    dashboard.appliance.createNetworkApplianceVlan(
-                        applianceIp=data[i]['applianceIp'],
-                        id=data[i]['id'],
-                        name=data[i]['name'],
-                        networkId=net['id'],
-                        subnet=data[i]['subnet'],
-                        groupPolicyId=data[i]['groupPolicyId']
-                    )
-        except KeyError as e:
-            logger.error(e)
-            logger.info('VLAN does not have a Group Policy')
-            if data[i]['id'] == 1:
-                dashboard.appliance.updateNetworkApplianceVlan(
-                    applianceIp=data[i]['applianceIp'],
-                    vlanId=data[i]['id'],
-                    name=data[i]['name'],
-                    networkId=net['id'],
-                    subnet=data[i]['subnet']
-                )
-            # For all other VLANs create them
-            # CHECK IF VLAN ALREADY EXISTS
-            # IF IT DOES, JUST UPDATE
-            else:
-                dashboard.appliance.createNetworkApplianceVlan(
-                    applianceIp=data[i]['applianceIp'],
-                    id=data[i]['id'],
-                    name=data[i]['name'],
-                    networkId=net['id'],
-                    subnet=data[i]['subnet']
-                )
-    # Default VLAN creation behavior does not modify DHCP settings on it, so need to now do an
-    # Update DHCP settings operation
-    for item in data:
-        if item['dhcpHandling'] != 'Do not respond to DHCP requests' \
-                and item['dhcpHandling'] != 'Relay DHCP to another server':
-            vlan_id = item['id']
-            upd = {k: item[k] for k in item.keys() - {'id', 'networkId'}}
-            dashboard.appliance.updateNetworkApplianceVlan(
-                networkId=net['id'],
-                vlanId=vlan_id,
-                **upd
-            )
-    # Update Port configurations on the MX to allow the specific VLANs
-    with open(f'{path}/network/{net["name"]}/appliance/vlans/vlan_ports.json') as fp:
-        data = json.load(fp)
-        fp.close()
-    devices = dashboard.networks.getNetworkDevices(networkId=net['id'])
-    for device in devices:
-        if device['model'] in ['MX64', 'MX64W', 'MX67', 'MX67W', 'MX67C', 'MX100']:
-            starting_port = 2
-        elif 'MX' in device['model']:
-            starting_port = 3
-    model_ports = dashboard.appliance.getNetworkAppliancePorts(networkId=net['id'])
-    # If trying to apply a backup to an MX with fewer ports stop at the last port
-    if len(data) < len(model_ports):
-        logger.info("MX has more ports than backup")
-        for i in range(len(data)):
-            upd = {k: data[i][k] for k in data[i].keys() - {'number'}}
-            dashboard.appliance.updateNetworkAppliancePort(
-                networkId=net['id'],
-                portId=i + starting_port,
-                **upd
-            )
-    else:
-        for i in range(len(model_ports)):
-            upd = {k: data[i][k] for k in data[i].keys() - {'number'}}
-            dashboard.appliance.updateNetworkAppliancePort(
-                networkId=net['id'],
-                portId=i + starting_port,
-                **upd
+            number = ssid.get("number")
+            name = ssid.get("name")
+            enabled = ssid.get("enabled", False)
+            auth_mode = ssid.get("authMode", "open")
+            encryption = ssid.get("encryptionMode", "open")
+            ip_assignment = ssid.get("ipAssignmentMode", "NAT mode")
+
+            if encryption is None:
+                encryption = "open"
+
+            print(f"[RESTORE] SSID {number}: {name}")
+
+            dashboard.wireless.updateNetworkWirelessSsid(
+                network_id,
+                number,
+                name=name,
+                enabled=enabled,
+                authMode=auth_mode,
+                encryptionMode=encryption,
+                ipAssignmentMode=ip_assignment
             )
 
-def restoreSwitchPortConfigs(net, dashboard, path):
-    """Function for restoring Switch Port configs"""
-    directory = f'{path}/network/{net["name"]}/switch/switch_settings'
-    port_schedules = dashboard.switch.getNetworkSwitchPortSchedules(networkId=net['id'])
-    access_policies = dashboard.switch.getNetworkSwitchAccessPolicies(networkId=net['id'])
-    # For each switch subfolder, read and update port configs
-    for subdirs, dirs, files in os.walk(directory):
-        for dir in dirs:
-            with open(f'{path}/network/{net["name"]}/switch/switch_settings/{dir}/switch_ports.json') as fp:
-                data = json.load(fp)
-                fp.close()
-            for port in data:
-                upd = port
-                port_id = upd['portId']
-                del upd['portId']
-                for schedule in port_schedules:
-                    if schedule['name']==upd['portScheduleId']:
-                        upd['portScheduleId']=schedule['id']
-                if port['type'] == 'access':
-                    if port['accessPolicyType'] != 'Open':
-                        for policy in access_policies:
-                            if policy['name'] == port['accessPolicyNumber']:
-                                upd['accessPolicyNumber']=int(policy['accessPolicyNumber'])
-                dashboard.switch.updateDeviceSwitchPort(serial=dir, portId=port_id, **upd)
+        except Exception as e:
+            print(f"[RESTORE ERROR] SSID {number}: {str(e)}")
+
+    print("[RESTORE DONE] SSIDs restored")
+
+
+# ==============================
+# 🛜 RESTORE WIRELESS SETTINGS
+# ==============================
+def restoreWirelessSettings(network_id, network_folder, dashboard):
+    file_path = os.path.join(
+        network_folder,
+        "wireless",
+        "wireless_settings.json"
+    )
+
+    settings = load_json_safe(file_path)
+    if not settings:
+        return
+
+    try:
+        print("[RESTORE] Wireless global settings")
+        dashboard.wireless.updateNetworkWirelessSettings(
+            network_id,
+            **settings
+        )
+    except Exception as e:
+        print(f"[RESTORE ERROR] Wireless settings: {str(e)}")
+
+
+# ==============================
+# 🖧 RESTORE SWITCH PORTS (MS)
+# ==============================
+def _load_json_if_exists(file_path):
+    if not os.path.exists(file_path):
+        return None
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _ensure_list(payload):
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        # Common wrappers from some endpoints/backups.
+        for key in ("items", "data", "rules", "servers", "alerts"):
+            if isinstance(payload.get(key), list):
+                return payload.get(key)
+        return [payload]
+    return []
+
+
+def _ensure_dict(payload):
+    return payload if isinstance(payload, dict) else {}
+
+
+def _drop_keys(payload, *keys):
+    if not isinstance(payload, dict):
+        return {}
+    blocked = set(keys)
+    return {k: v for k, v in payload.items() if k not in blocked}
+
+
+def _is_valid_meraki_serial(value):
+    if not isinstance(value, str):
+        return False
+    return re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}", value.strip().upper()) is not None
+
+
+def _is_valid_ip_or_cidr_or_any(value):
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if token.lower() == "any":
+        return True
+    try:
+        ipaddress.ip_network(token, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_valid_http_url(value):
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if not token:
+        return False
+    parsed = urlparse(token)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _sanitize_ssid_l3_firewall_payload(payload, ssid_number):
+    if not isinstance(payload, dict):
+        return {}
+    cleaned = dict(payload)
+    rules = _ensure_list(cleaned.get("rules"))
+    cleaned_rules = []
+
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            continue
+        rule_clean = dict(rule)
+        dst_cidr = rule_clean.get("destCidr", rule_clean.get("dstCidr"))
+        if isinstance(dst_cidr, str):
+            token = dst_cidr.strip()
+            if token.lower() == "local lan":
+                token = "any"
+            elif token.lower() == "any":
+                token = "any"
+            if not _is_valid_ip_or_cidr_or_any(token):
+                print(
+                    f"[RESTORE WARN] SSID {ssid_number} firewall_l3 rule {idx} skipped "
+                    f"(invalid destCidr: {dst_cidr})"
+                )
+                continue
+            rule_clean["destCidr"] = token
+        else:
+            rule_clean["destCidr"] = "any"
+        rule_clean.pop("dstCidr", None)
+        cleaned_rules.append(rule_clean)
+
+    cleaned["rules"] = cleaned_rules
+    return cleaned
+
+
+def _sanitize_splash_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    cleaned = dict(payload)
+    cleaned.pop("ssidNumber", None)
+
+    use_splash = bool(cleaned.get("useSplashUrl", False))
+    splash_url = cleaned.get("splashUrl")
+    if use_splash:
+        if not _is_valid_http_url(splash_url):
+            cleaned["useSplashUrl"] = False
+            cleaned.pop("splashUrl", None)
+    else:
+        cleaned.pop("splashUrl", None)
+
+    use_redirect = bool(cleaned.get("useRedirectUrl", False))
+    redirect_url = cleaned.get("redirectUrl")
+    if use_redirect:
+        if not _is_valid_http_url(redirect_url):
+            cleaned["useRedirectUrl"] = False
+            cleaned.pop("redirectUrl", None)
+    else:
+        cleaned.pop("redirectUrl", None)
+
+    # Remove null md5 blobs that break strict schema validation in some orgs.
+    for key in ("splashImage", "splashPrepaidFront", "splashLogo"):
+        blob = cleaned.get(key)
+        if isinstance(blob, dict) and blob.get("md5") is None:
+            cleaned.pop(key, None)
+
+    return cleaned
+
+
+def restoreWirelessComplete(network_id, network_folder, dashboard):
+    wireless_root = os.path.join(network_folder, "wireless")
+    ssid_root = os.path.join(wireless_root, "ssids")
+    radio_root = os.path.join(wireless_root, "device_radio")
+
+    # 1) Network-wide wireless settings
+    restoreWirelessSettings(network_id, network_folder, dashboard)
+
+    bluetooth = _load_json_if_exists(os.path.join(wireless_root, "bluetooth_settings.json"))
+    if bluetooth is not None:
+        try:
+            dashboard.wireless.updateNetworkWirelessBluetoothSettings(network_id, **bluetooth)
+            print("[RESTORE] Wireless bluetooth settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Wireless bluetooth settings: {e}")
+
+    # Air Marshal restore
+    air_marshal_settings = _load_json_if_exists(os.path.join(wireless_root, "air_marshal_settings.json")) or []
+    if isinstance(air_marshal_settings, dict):
+        settings_list = [air_marshal_settings]
+    elif isinstance(air_marshal_settings, list):
+        settings_list = air_marshal_settings
+    else:
+        settings_list = []
+
+    if settings_list:
+        setting = settings_list[0]
+        default_policy = setting.get("defaultPolicy")
+        if default_policy:
+            try:
+                dashboard.wireless.updateNetworkWirelessAirMarshalSettings(
+                    network_id,
+                    defaultPolicy=default_policy
+                )
+                print("[RESTORE] Air Marshal settings restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] Air Marshal settings: {e}")
+
+    air_marshal_rules = _load_json_if_exists(os.path.join(wireless_root, "air_marshal_rules.json")) or []
+    if isinstance(air_marshal_rules, dict):
+        rules_list = [air_marshal_rules]
+    elif isinstance(air_marshal_rules, list):
+        rules_list = air_marshal_rules
+    else:
+        rules_list = []
+
+    for rule in rules_list:
+        rule_type = rule.get("type")
+        match = rule.get("match")
+        if not rule_type or not match:
+            continue
+
+        rule_id = rule.get("ruleId") or rule.get("id")
+        if rule_id:
+            try:
+                dashboard.wireless.updateNetworkWirelessAirMarshalRule(
+                    network_id,
+                    rule_id,
+                    type=rule_type,
+                    match=match
+                )
+                print(f"[RESTORE] Air Marshal rule updated: {rule_id}")
+                continue
+            except Exception:
+                pass
+
+        try:
+            dashboard.wireless.createNetworkWirelessAirMarshalRule(
+                network_id,
+                type=rule_type,
+                match=match
+            )
+            print("[RESTORE] Air Marshal rule created")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Air Marshal rule: {e}")
+
+    # 2) SSID base config (includes access control + availability fields)
+    ssids = _load_json_if_exists(os.path.join(ssid_root, "ssids.json"))
+    if ssids is None:
+        # backward compatibility with old snapshots
+        ssids = _load_json_if_exists(os.path.join(network_folder, "ssids", "ssids.json"))
+    ssids = _ensure_list(ssids)
+
+    if ssids:
+        print(f"[RESTORE] Found {len(ssids)} SSIDs in snapshot")
+
+    for ssid in ssids:
+        if not isinstance(ssid, dict):
+            continue
+        number = ssid.get("number")
+        if number is None:
+            continue
+
+        try:
+            ssid_payload = _drop_keys(ssid, "number")
+            dashboard.wireless.updateNetworkWirelessSsid(network_id, number, **ssid_payload)
+            print(f"[RESTORE] SSID {number} base settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] SSID {number} base settings: {e}")
+
+        ssid_path = os.path.join(ssid_root, str(number))
+        if not os.path.exists(ssid_path):
+            continue
+
+        per_ssid_updates = [
+            ("firewall_l3.json", dashboard.wireless.updateNetworkWirelessSsidFirewallL3FirewallRules),
+            ("firewall_l7.json", dashboard.wireless.updateNetworkWirelessSsidFirewallL7FirewallRules),
+            ("traffic_shaping.json", dashboard.wireless.updateNetworkWirelessSsidTrafficShapingRules),
+            ("splash_settings.json", dashboard.wireless.updateNetworkWirelessSsidSplashSettings),
+            ("schedules.json", dashboard.wireless.updateNetworkWirelessSsidSchedules),
+            ("hotspot20.json", dashboard.wireless.updateNetworkWirelessSsidHotspot20),
+            ("bonjour_forwarding.json", dashboard.wireless.updateNetworkWirelessSsidBonjourForwarding),
+            ("vpn.json", dashboard.wireless.updateNetworkWirelessSsidVpn),
+        ]
+
+        for file_name, api_call in per_ssid_updates:
+            payload = _load_json_if_exists(os.path.join(ssid_path, file_name))
+            if payload is None:
+                continue
+            try:
+                if file_name == "vpn.json" and isinstance(payload, dict):
+                    vpn_payload = dict(payload)
+                    request_ip = vpn_payload.get("requestIp")
+                    if request_ip is None:
+                        vpn_payload.pop("requestIp", None)
+                    elif not isinstance(request_ip, str):
+                        vpn_payload["requestIp"] = str(request_ip)
+                    api_call(network_id, number, **vpn_payload)
+                    print(f"[RESTORE] SSID {number} {file_name} restored")
+                    continue
+                if file_name == "firewall_l3.json":
+                    fw_payload = _sanitize_ssid_l3_firewall_payload(payload, number)
+                    api_call(network_id, number, **fw_payload)
+                    print(f"[RESTORE] SSID {number} {file_name} restored")
+                    continue
+                if file_name == "splash_settings.json":
+                    splash_payload = _sanitize_splash_payload(payload)
+                    api_call(network_id, number, **splash_payload)
+                    print(f"[RESTORE] SSID {number} {file_name} restored")
+                    continue
+                api_call(network_id, number, **payload)
+                print(f"[RESTORE] SSID {number} {file_name} restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] SSID {number} {file_name}: {e}")
+
+        identity_psks = _ensure_list(_load_json_if_exists(os.path.join(ssid_path, "identity_psks.json")))
+        for psk in identity_psks:
+            if not isinstance(psk, dict):
+                continue
+            identity_psk_id = psk.get("identityPskId") or psk.get("id")
+            if not identity_psk_id:
+                continue
+            try:
+                dashboard.wireless.updateNetworkWirelessSsidIdentityPsk(
+                    network_id,
+                    number,
+                    identity_psk_id,
+                    **psk,
+                )
+                print(f"[RESTORE] SSID {number} identity PSK {identity_psk_id} restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] SSID {number} identity PSK {identity_psk_id}: {e}")
+
+    # 3) RF profiles (radio/power policy set)
+    rf_profiles = _ensure_list(_load_json_if_exists(os.path.join(wireless_root, "rf_profiles.json")))
+    for profile in rf_profiles:
+        if not isinstance(profile, dict):
+            continue
+        rf_profile_id = profile.get("id")
+        if not rf_profile_id:
+            continue
+        try:
+            dashboard.wireless.updateNetworkWirelessRfProfile(network_id, rf_profile_id, **profile)
+            print(f"[RESTORE] RF profile restored: {rf_profile_id}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] RF profile {rf_profile_id}: {e}")
+
+    # 4) AP-level radio overrides (per device)
+    if os.path.exists(radio_root):
+        for filename in os.listdir(radio_root):
+            if not filename.endswith(".json"):
+                continue
+            serial = filename[:-5]
+            payload = _load_json_if_exists(os.path.join(radio_root, filename))
+            if payload is None:
+                continue
+            try:
+                dashboard.wireless.updateDeviceWirelessRadioSettings(serial, **payload)
+                print(f"[RESTORE] Device radio restored: {serial}")
+            except Exception as e:
+                print(f"[RESTORE ERROR] Device radio {serial}: {e}")
+
+    print("[RESTORE DONE] Wireless complete restore completed")
+
+
+def restoreSwitch(network_id, network_folder, dashboard, org_id=None, target_network=None):
+    switch_root = os.path.join(network_folder, "switch")
+
+    if not os.path.exists(switch_root):
+        print("[RESTORE SKIP] No switch folder")
+        return
+
+    # Configure > Switch Settings
+    switch_settings = _load_json_if_exists(os.path.join(switch_root, "switch_settings.json"))
+    if switch_settings:
+        try:
+            dashboard.switch.updateNetworkSwitchSettings(network_id, **switch_settings)
+            print("[RESTORE] Switch settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch settings: {e}")
+
+    # Configure > ACL
+    acl = _load_json_if_exists(os.path.join(switch_root, "acl.json"))
+    if acl and isinstance(acl, dict):
+        try:
+            dashboard.switch.updateNetworkSwitchAccessControlLists(
+                network_id,
+                rules=acl.get("rules", [])
+            )
+            print("[RESTORE] Switch ACL restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch ACL: {e}")
+
+    # Configure > Access Policies
+    access_policies = _ensure_list(_load_json_if_exists(os.path.join(switch_root, "access_policies.json")))
+    existing_policies = []
+    try:
+        existing_policies = dashboard.switch.getNetworkSwitchAccessPolicies(network_id)
+    except Exception:
+        pass
+    existing_by_name = {p.get("name"): p for p in existing_policies if p.get("name")}
+
+    for policy in access_policies:
+        if not isinstance(policy, dict):
+            continue
+        policy_name = policy.get("name")
+        if not policy_name:
+            continue
+        existing = existing_by_name.get(policy_name)
+        try:
+            if existing:
+                access_policy_number = existing.get("accessPolicyNumber")
+                dashboard.switch.updateNetworkSwitchAccessPolicy(
+                    network_id,
+                    access_policy_number,
+                    **policy
+                )
+            else:
+                if "radiusServers" in policy and "radiusAccountingEnabled" in policy:
+                    dashboard.switch.createNetworkSwitchAccessPolicy(
+                        network_id,
+                        name=policy_name,
+                        radiusServers=policy.get("radiusServers", []),
+                        radiusAccountingEnabled=policy.get("radiusAccountingEnabled", False),
+                        **policy
+                    )
+                else:
+                    continue
+            print(f"[RESTORE] Switch access policy restored: {policy_name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch access policy {policy_name}: {e}")
+
+    # Configure > Port Schedules
+    port_schedules = _ensure_list(_load_json_if_exists(os.path.join(switch_root, "port_schedules.json")))
+    existing_schedules = []
+    try:
+        existing_schedules = dashboard.switch.getNetworkSwitchPortSchedules(network_id)
+    except Exception:
+        pass
+    existing_schedule_by_name = {s.get("name"): s for s in existing_schedules if s.get("name")}
+
+    for schedule in port_schedules:
+        if not isinstance(schedule, dict):
+            continue
+        schedule_name = schedule.get("name")
+        if not schedule_name:
+            continue
+        existing = existing_schedule_by_name.get(schedule_name)
+        try:
+            if existing:
+                dashboard.switch.updateNetworkSwitchPortSchedule(
+                    network_id,
+                    existing.get("id"),
+                    **schedule
+                )
+            else:
+                dashboard.switch.createNetworkSwitchPortSchedule(
+                    network_id,
+                    name=schedule_name,
+                    **schedule
+                )
+            print(f"[RESTORE] Switch port schedule restored: {schedule_name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch port schedule {schedule_name}: {e}")
+
+    # Configure > Routing & DHCP (network-level)
+    dhcp_policy = _load_json_if_exists(os.path.join(switch_root, "dhcp_server_policy.json"))
+    if dhcp_policy:
+        try:
+            dashboard.switch.updateNetworkSwitchDhcpServerPolicy(network_id, **dhcp_policy)
+            print("[RESTORE] Switch DHCP server policy restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch DHCP policy: {e}")
+
+    arp_servers = _ensure_list(_load_json_if_exists(os.path.join(switch_root, "arp_trusted_servers.json")))
+    existing_arp = []
+    try:
+        existing_arp = dashboard.switch.getNetworkSwitchDhcpServerPolicyArpInspectionTrustedServers(
+            network_id,
+            total_pages="all"
+        )
+    except Exception:
+        pass
+    existing_arp_by_mac_vlan = {
+        f"{x.get('mac')}|{x.get('vlan')}": x for x in existing_arp
+    }
+
+    for server in arp_servers:
+        if not isinstance(server, dict):
+            continue
+        key = f"{server.get('mac')}|{server.get('vlan')}"
+        try:
+            existing = existing_arp_by_mac_vlan.get(key)
+            if existing and existing.get("trustedServerId"):
+                dashboard.switch.updateNetworkSwitchDhcpServerPolicyArpInspectionTrustedServer(
+                    network_id,
+                    existing.get("trustedServerId"),
+                    **server
+                )
+            else:
+                dashboard.switch.createNetworkSwitchDhcpServerPolicyArpInspectionTrustedServer(
+                    network_id,
+                    mac=server.get("mac"),
+                    vlan=server.get("vlan"),
+                    ipv4=server.get("ipv4", {})
+                )
+            print(f"[RESTORE] ARP trusted server restored: {key}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] ARP trusted server {key}: {e}")
+
+    ospf = _load_json_if_exists(os.path.join(switch_root, "routing_ospf.json"))
+    if ospf:
+        try:
+            ospf_payload = dict(ospf) if isinstance(ospf, dict) else {}
+            areas = _ensure_list(ospf_payload.get("areas"))
+            v3 = _ensure_dict(ospf_payload.get("v3"))
+            v3_areas = _ensure_list(v3.get("areas"))
+            ospf_enabled = bool(ospf_payload.get("enabled", False))
+            v3_enabled = bool(v3.get("enabled", False))
+            if ospf_enabled and not areas:
+                print("[RESTORE SKIP] Switch OSPF skipped: enabled but no areas")
+            elif v3_enabled and not v3_areas:
+                print("[RESTORE SKIP] Switch OSPF v3 skipped: enabled but no v3 areas")
+            else:
+                dashboard.switch.updateNetworkSwitchRoutingOspf(network_id, **ospf_payload)
+                print("[RESTORE] Switch OSPF restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch OSPF: {e}")
+
+    multicast = _load_json_if_exists(os.path.join(switch_root, "routing_multicast.json"))
+    if multicast:
+        try:
+            dashboard.switch.updateNetworkSwitchRoutingMulticast(network_id, **multicast)
+            print("[RESTORE] Switch multicast restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch multicast: {e}")
+
+    # Other switch global settings
+    stp = _load_json_if_exists(os.path.join(switch_root, "stp.json"))
+    if stp:
+        try:
+            dashboard.switch.updateNetworkSwitchStp(network_id, **stp)
+            print("[RESTORE] Switch STP restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch STP: {e}")
+
+    mtu = _load_json_if_exists(os.path.join(switch_root, "mtu.json"))
+    if mtu:
+        try:
+            dashboard.switch.updateNetworkSwitchMtu(network_id, **mtu)
+            print("[RESTORE] Switch MTU restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch MTU: {e}")
+
+    dscp = _load_json_if_exists(os.path.join(switch_root, "dscp_to_cos.json"))
+    if dscp and isinstance(dscp, dict):
+        try:
+            dashboard.switch.updateNetworkSwitchDscpToCosMappings(
+                network_id,
+                mappings=dscp.get("mappings", [])
+            )
+            print("[RESTORE] Switch DSCP-to-CoS mappings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch DSCP-to-CoS mappings: {e}")
+
+    qos_rules = _ensure_list(_load_json_if_exists(os.path.join(switch_root, "qos_rules.json")))
+    existing_qos = []
+    try:
+        existing_qos = dashboard.switch.getNetworkSwitchQosRules(network_id)
+    except Exception:
+        pass
+    existing_qos_by_vlan_proto = {
+        f"{x.get('vlan')}|{x.get('protocol')}|{x.get('srcPort')}|{x.get('dstPort')}": x
+        for x in existing_qos
+    }
+
+    restored_qos_ids = []
+    for rule in qos_rules:
+        if not isinstance(rule, dict):
+            continue
+        key = f"{rule.get('vlan')}|{rule.get('protocol')}|{rule.get('srcPort')}|{rule.get('dstPort')}"
+        try:
+            existing = existing_qos_by_vlan_proto.get(key)
+            if existing and existing.get("id"):
+                dashboard.switch.updateNetworkSwitchQosRule(network_id, existing.get("id"), **rule)
+                restored_qos_ids.append(existing.get("id"))
+            else:
+                created = dashboard.switch.createNetworkSwitchQosRule(
+                    network_id,
+                    vlan=rule.get("vlan"),
+                    **rule
+                )
+                new_id = created.get("id") if isinstance(created, dict) else None
+                if new_id:
+                    restored_qos_ids.append(new_id)
+            print(f"[RESTORE] Switch QoS rule restored: {key}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch QoS rule {key}: {e}")
+
+    qos_order = _load_json_if_exists(os.path.join(switch_root, "qos_rules_order.json"))
+    if qos_order and isinstance(qos_order, dict):
+        rule_ids = qos_order.get("ruleIds") or restored_qos_ids
+        if rule_ids:
+            try:
+                dashboard.switch.updateNetworkSwitchQosRulesOrder(network_id, ruleIds=rule_ids)
+                print("[RESTORE] Switch QoS rule order restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] Switch QoS rule order: {e}")
+
+    link_aggs = _ensure_list(_load_json_if_exists(os.path.join(switch_root, "link_aggregations.json")))
+    existing_aggs = []
+    try:
+        existing_aggs = dashboard.switch.getNetworkSwitchLinkAggregations(network_id)
+    except Exception:
+        pass
+    existing_agg_by_ports = {
+        json.dumps(x.get("switchPorts", []), sort_keys=True): x
+        for x in existing_aggs
+    }
+
+    for agg in link_aggs:
+        if not isinstance(agg, dict):
+            continue
+        agg_ports_key = json.dumps(agg.get("switchPorts", []), sort_keys=True)
+        try:
+            existing = existing_agg_by_ports.get(agg_ports_key)
+            if existing and existing.get("id"):
+                dashboard.switch.updateNetworkSwitchLinkAggregation(
+                    network_id,
+                    existing.get("id"),
+                    **agg
+                )
+            else:
+                dashboard.switch.createNetworkSwitchLinkAggregation(network_id, **agg)
+            print("[RESTORE] Switch link aggregation restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch link aggregation: {e}")
+
+    # Configure > Staged Upgrades
+    firmware = _load_json_if_exists(os.path.join(switch_root, "firmware_upgrades.json"))
+    if firmware:
+        try:
+            dashboard.networks.updateNetworkFirmwareUpgrades(network_id, **firmware)
+            print("[RESTORE] Switch staged upgrades restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Switch staged upgrades: {e}")
+
+    # Configure > Port Profiles (template-bound network only)
+    if org_id and target_network and target_network.get("configTemplateId"):
+        config_template_id = target_network.get("configTemplateId")
+        profile_ports_root = os.path.join(switch_root, "port_profile_ports")
+        if os.path.exists(profile_ports_root):
+            for filename in os.listdir(profile_ports_root):
+                if not filename.endswith(".json"):
+                    continue
+                profile_id = filename[:-5]
+                ports = _ensure_list(_load_json_if_exists(os.path.join(profile_ports_root, filename)))
+                for port in ports:
+                    if not isinstance(port, dict):
+                        continue
+                    port_id = port.get("portId")
+                    if not port_id:
+                        continue
+                    try:
+                        clean_port = _drop_keys(port, "portId")
+                        dashboard.switch.updateOrganizationConfigTemplateSwitchProfilePort(
+                            org_id,
+                            config_template_id,
+                            profile_id,
+                            port_id,
+                            **clean_port
+                        )
+                    except Exception as e:
+                        print(f"[RESTORE ERROR] Port profile {profile_id} port {port_id}: {e}")
+            print("[RESTORE] Switch port profiles restored (template)")
+
+    # Device-level configs: ports + routing interfaces/static routes + per-interface DHCP
+    devices_root = os.path.join(switch_root, "devices")
+    legacy_devices_root = switch_root
+    if os.path.exists(devices_root) or os.path.exists(legacy_devices_root):
+        print("[RESTORE] Restoring Switch device-level settings...")
+        root_to_use = devices_root if os.path.exists(devices_root) else legacy_devices_root
+        for serial in os.listdir(root_to_use):
+            serial_root = os.path.join(root_to_use, serial)
+            if not os.path.isdir(serial_root):
+                continue
+            if not (
+                os.path.exists(os.path.join(serial_root, "ports.json"))
+                or os.path.exists(os.path.join(serial_root, "routing_interfaces.json"))
+                or os.path.exists(os.path.join(serial_root, "routing_static_routes.json"))
+            ):
+                continue
+
+            ports = _ensure_list(_load_json_if_exists(os.path.join(serial_root, "ports.json")))
+            for port in ports:
+                if not isinstance(port, dict):
+                    continue
+                port_id = port.get("portId")
+                if port_id is None:
+                    continue
+                try:
+                    clean_port = _drop_keys(port, "portId")
+                    dashboard.switch.updateDeviceSwitchPort(serial, port_id, **clean_port)
+                except Exception as e:
+                    print(f"[RESTORE ERROR] Switch {serial} Port {port_id}: {e}")
+
+            interfaces = _ensure_list(_load_json_if_exists(os.path.join(serial_root, "routing_interfaces.json")))
+            existing_if = []
+            try:
+                existing_if = dashboard.switch.getDeviceSwitchRoutingInterfaces(serial)
+            except Exception:
+                pass
+            existing_if_by_name = {x.get("name"): x for x in existing_if if x.get("name")}
+
+            for interface in interfaces:
+                if not isinstance(interface, dict):
+                    continue
+                interface_id = interface.get("interfaceId")
+                interface_name = interface.get("name")
+                try:
+                    clean_interface = _drop_keys(interface, "interfaceId")
+                    if interface_id:
+                        dashboard.switch.updateDeviceSwitchRoutingInterface(
+                            serial,
+                            interface_id,
+                            **clean_interface
+                        )
+                    elif interface_name and interface_name in existing_if_by_name:
+                        dashboard.switch.updateDeviceSwitchRoutingInterface(
+                            serial,
+                            existing_if_by_name[interface_name].get("interfaceId"),
+                            **clean_interface
+                        )
+                    elif interface_name:
+                        create_interface = _drop_keys(clean_interface, "name")
+                        dashboard.switch.createDeviceSwitchRoutingInterface(
+                            serial,
+                            name=interface_name,
+                            **create_interface
+                        )
+                except Exception as e:
+                    print(f"[RESTORE ERROR] Switch {serial} routing interface {interface_name}: {e}")
+
+            interface_dhcp = _load_json_if_exists(os.path.join(serial_root, "routing_interface_dhcp.json")) or {}
+            for interface_id, dhcp_cfg in interface_dhcp.items():
+                try:
+                    dashboard.switch.updateDeviceSwitchRoutingInterfaceDhcp(serial, interface_id, **dhcp_cfg)
+                except Exception as e:
+                    print(f"[RESTORE ERROR] Switch {serial} DHCP {interface_id}: {e}")
+
+            static_routes = _ensure_list(_load_json_if_exists(os.path.join(serial_root, "routing_static_routes.json")))
+            if not static_routes:
+                continue
+            existing_routes = []
+            try:
+                existing_routes = dashboard.switch.getDeviceSwitchRoutingStaticRoutes(serial)
+            except Exception:
+                pass
+            existing_route_by_name = {x.get("name"): x for x in existing_routes if x.get("name")}
+
+            for route in static_routes:
+                if not isinstance(route, dict):
+                    continue
+                route_name = route.get("name")
+                route_id = route.get("staticRouteId")
+                try:
+                    clean_route = _drop_keys(route, "staticRouteId", "name", "subnet", "nextHopIp")
+                    if route_id:
+                        dashboard.switch.updateDeviceSwitchRoutingStaticRoute(
+                            serial,
+                            route_id,
+                            **clean_route
+                        )
+                    elif route_name and route_name in existing_route_by_name:
+                        dashboard.switch.updateDeviceSwitchRoutingStaticRoute(
+                            serial,
+                            existing_route_by_name[route_name].get("staticRouteId"),
+                            **clean_route
+                        )
+                    elif route.get("subnet") and route.get("nextHopIp"):
+                        dashboard.switch.createDeviceSwitchRoutingStaticRoute(
+                            serial,
+                            subnet=route.get("subnet"),
+                            nextHopIp=route.get("nextHopIp"),
+                            **clean_route
+                        )
+                except Exception as e:
+                    print(f"[RESTORE ERROR] Switch {serial} static route {route_name}: {e}")
+
+    print("[RESTORE DONE] Switch full restore completed")
+
+
+# ==============================
+# 🌐 RESTORE NETWORK-WIDE (SYSLOG/SNMP/ALERTS)
+# ==============================
+def restoreNetworkWide(network_id, network_folder, dashboard):
+    nw_folder = os.path.join(network_folder, "network_wide")
+
+    if not os.path.exists(nw_folder):
+        print("[RESTORE SKIP] No network_wide folder")
+        return
+
+    # Configure > General
+    network_info = _load_json_if_exists(os.path.join(nw_folder, "network_info.json"))
+    if network_info:
+        try:
+            network_info_payload = dict(network_info) if isinstance(network_info, dict) else {}
+            if not isinstance(network_info_payload.get("enrollmentString"), str):
+                network_info_payload.pop("enrollmentString", None)
+            dashboard.networks.updateNetwork(network_id, **network_info_payload)
+            print("[RESTORE] Network general info restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Network general info: {e}")
+
+    network_settings = _load_json_if_exists(os.path.join(nw_folder, "network_settings.json"))
+    if network_settings:
+        try:
+            dashboard.networks.updateNetworkSettings(network_id, **network_settings)
+            print("[RESTORE] Network administration settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Network administration settings: {e}")
+
+    # Configure > Administration
+    syslog = _load_json_if_exists(os.path.join(nw_folder, "syslog.json"))
+    if syslog:
+        try:
+            dashboard.networks.updateNetworkSyslogServers(
+                network_id,
+                servers=syslog.get("servers", [])
+            )
+            print("[RESTORE] Syslog restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Syslog: {e}")
+
+    snmp = _load_json_if_exists(os.path.join(nw_folder, "snmp.json"))
+    if snmp:
+        try:
+            snmp_payload = dict(snmp) if isinstance(snmp, dict) else {}
+            if not isinstance(snmp_payload.get("communityString"), str):
+                snmp_payload.pop("communityString", None)
+            dashboard.networks.updateNetworkSnmp(network_id, **snmp_payload)
+            print("[RESTORE] SNMP restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] SNMP: {e}")
+
+    traffic_analysis = _load_json_if_exists(os.path.join(nw_folder, "traffic_analysis.json"))
+    if traffic_analysis:
+        try:
+            dashboard.networks.updateNetworkTrafficAnalysis(network_id, **traffic_analysis)
+            print("[RESTORE] Traffic analysis settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Traffic analysis settings: {e}")
+
+    netflow = _load_json_if_exists(os.path.join(nw_folder, "netflow.json"))
+    if netflow:
+        try:
+            dashboard.networks.updateNetworkNetflow(network_id, **netflow)
+            print("[RESTORE] NetFlow settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] NetFlow settings: {e}")
+
+    # Configure > Alerts
+    alerts = _load_json_if_exists(os.path.join(nw_folder, "alerts.json"))
+    if alerts:
+        try:
+            dashboard.networks.updateNetworkAlertsSettings(network_id, **alerts)
+            print("[RESTORE] Alerts restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Alerts: {e}")
+
+    # Configure > Group Policies
+    group_policies = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "group_policies.json")))
+    existing_policies = []
+    try:
+        existing_policies = dashboard.networks.getNetworkGroupPolicies(network_id)
+    except Exception:
+        pass
+    existing_policy_by_name = {p.get("name"): p for p in existing_policies if p.get("name")}
+
+    for policy in group_policies:
+        if not isinstance(policy, dict):
+            continue
+        name = policy.get("name")
+        if not name:
+            continue
+        existing = existing_policy_by_name.get(name)
+        try:
+            if existing and existing.get("groupPolicyId"):
+                dashboard.networks.updateNetworkGroupPolicy(
+                    network_id,
+                    existing.get("groupPolicyId"),
+                    **policy
+                )
+            else:
+                create_payload = dict(policy)
+                create_payload.pop("name", None)
+                dashboard.networks.createNetworkGroupPolicy(network_id, name=name, **create_payload)
+            print(f"[RESTORE] Group policy restored: {name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Group policy {name}: {e}")
+
+    # Configure > Users (Meraki Auth)
+    meraki_auth_users = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "meraki_auth_users.json")))
+    existing_users = []
+    try:
+        existing_users = dashboard.networks.getNetworkMerakiAuthUsers(network_id)
+    except Exception:
+        pass
+    existing_user_by_key = {}
+    for u in existing_users:
+        if not isinstance(u, dict):
+            continue
+        key = (u.get("email"), u.get("accountType"))
+        if key[0]:
+            existing_user_by_key[key] = u
+
+    for user in meraki_auth_users:
+        if not isinstance(user, dict):
+            continue
+        email = user.get("email")
+        if not email:
+            continue
+        account_type = user.get("accountType")
+        if account_type == "Client VPN":
+            print(f"[RESTORE SKIP] Meraki auth user {email} (Client VPN accountType)")
+            continue
+
+        valid_authz = []
+        for auth in _ensure_list(user.get("authorizations")):
+            if not isinstance(auth, dict):
+                continue
+            if auth.get("ssidNumber") is None:
+                continue
+            auth_clean = {
+                "ssidNumber": auth.get("ssidNumber"),
+                "authorizedZone": auth.get("authorizedZone"),
+                "expiresAt": auth.get("expiresAt"),
+            }
+            valid_authz.append({k: v for k, v in auth_clean.items() if v is not None})
+        if not valid_authz:
+            print(f"[RESTORE SKIP] Meraki auth user {email} (no valid authorizations)")
+            continue
+
+        existing = existing_user_by_key.get((email, account_type))
+        try:
+            existing_user_id = existing.get("id") or existing.get("merakiAuthUserId")
+            update_payload = _drop_keys(
+                user,
+                "id",
+                "email",
+                "createdAt",
+                "accountType",
+                "isAdmin",
+                "authorizations",
+            )
+            if user.get("isAdmin"):
+                update_payload.pop("name", None)
+            update_payload["authorizations"] = valid_authz
+            if existing and existing_user_id:
+                dashboard.networks.updateNetworkMerakiAuthUser(
+                    network_id,
+                    existing_user_id,
+                    **update_payload
+                )
+            else:
+                create_payload = dict(update_payload)
+                dashboard.networks.createNetworkMerakiAuthUser(
+                    network_id,
+                    email=email,
+                    authorizations=valid_authz,
+                    **create_payload
+                )
+            print(f"[RESTORE] Meraki auth user restored: {email}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Meraki auth user {email}: {e}")
+
+    # Configure > VLAN Profiles
+    vlan_profiles = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "vlan_profiles.json")))
+    existing_profiles = []
+    try:
+        existing_profiles = dashboard.networks.getNetworkVlanProfiles(network_id)
+    except Exception:
+        pass
+    existing_by_iname = {p.get("iname"): p for p in existing_profiles if p.get("iname")}
+
+    for profile in vlan_profiles:
+        if not isinstance(profile, dict):
+            continue
+        iname = profile.get("iname")
+        if not iname:
+            continue
+        try:
+            if iname in existing_by_iname:
+                dashboard.networks.updateNetworkVlanProfile(
+                    network_id,
+                    iname=iname,
+                    name=profile.get("name"),
+                    vlanNames=profile.get("vlanNames", []),
+                    vlanGroups=profile.get("vlanGroups", [])
+                )
+            else:
+                dashboard.networks.createNetworkVlanProfile(
+                    network_id,
+                    iname=iname,
+                    name=profile.get("name"),
+                    vlanNames=profile.get("vlanNames", []),
+                    vlanGroups=profile.get("vlanGroups", [])
+                )
+            print(f"[RESTORE] VLAN profile restored: {iname}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] VLAN profile {iname}: {e}")
+
+    assignments = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "vlan_profile_assignments_by_device.json")))
+    if assignments:
+        grouped = {}
+        for item in assignments:
+            if not isinstance(item, dict):
+                continue
+            vlan_profile = item.get("vlanProfile")
+            if not vlan_profile:
+                continue
+            key = json.dumps(vlan_profile, sort_keys=True)
+            if key not in grouped:
+                grouped[key] = {"vlanProfile": vlan_profile, "serials": [], "stackIds": []}
+
+            serial = item.get("serial")
+            stack_id = item.get("stackId")
+            if serial:
+                grouped[key]["serials"].append(serial)
+            if stack_id:
+                grouped[key]["stackIds"].append(stack_id)
+
+        for payload in grouped.values():
+            if not payload["serials"] and not payload["stackIds"]:
+                continue
+            try:
+                dashboard.networks.reassignNetworkVlanProfilesAssignments(
+                    network_id,
+                    serials=payload["serials"],
+                    stackIds=payload["stackIds"],
+                    vlanProfile=payload["vlanProfile"]
+                )
+                print("[RESTORE] VLAN profile assignments restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] VLAN profile assignments: {e}")
+
+    # Configure > Webhooks
+    payload_templates = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "webhooks_payload_templates.json")))
+    existing_templates = []
+    try:
+        existing_templates = dashboard.networks.getNetworkWebhooksPayloadTemplates(network_id)
+    except Exception:
+        pass
+    existing_template_by_name = {x.get("name"): x for x in existing_templates if x.get("name")}
+
+    for template in payload_templates:
+        if not isinstance(template, dict):
+            continue
+        name = template.get("name")
+        if not name:
+            continue
+        try:
+            existing = existing_template_by_name.get(name)
+            if existing and existing.get("payloadTemplateId"):
+                dashboard.networks.updateNetworkWebhooksPayloadTemplate(
+                    network_id,
+                    existing.get("payloadTemplateId"),
+                    **template
+                )
+            else:
+                create_payload = dict(template)
+                create_payload.pop("name", None)
+                dashboard.networks.createNetworkWebhooksPayloadTemplate(
+                    network_id,
+                    name=name,
+                    **create_payload
+                )
+            print(f"[RESTORE] Webhook payload template restored: {name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Webhook payload template {name}: {e}")
+
+    http_servers = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "webhooks_http_servers.json")))
+    existing_servers = []
+    try:
+        existing_servers = dashboard.networks.getNetworkWebhooksHttpServers(network_id)
+    except Exception:
+        pass
+    existing_server_by_name = {x.get("name"): x for x in existing_servers if x.get("name")}
+
+    for server in http_servers:
+        if not isinstance(server, dict):
+            continue
+        name = server.get("name")
+        if not name:
+            continue
+        try:
+            existing = existing_server_by_name.get(name)
+            if existing and existing.get("id"):
+                dashboard.networks.updateNetworkWebhooksHttpServer(
+                    network_id,
+                    existing.get("id"),
+                    **server
+                )
+            elif server.get("url"):
+                create_payload = dict(server)
+                create_payload.pop("name", None)
+                create_payload.pop("url", None)
+                dashboard.networks.createNetworkWebhooksHttpServer(
+                    network_id,
+                    name=name,
+                    url=server.get("url"),
+                    **create_payload
+                )
+            print(f"[RESTORE] Webhook HTTP server restored: {name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Webhook HTTP server {name}: {e}")
+
+    # Configure > Add Devices (best-effort: claim missing devices from snapshot)
+    snapshot_devices = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "network_devices.json")))
+    if snapshot_devices:
+        try:
+            current_devices = dashboard.networks.getNetworkDevices(network_id)
+            current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
+            snapshot_serials = [d.get("serial") for d in snapshot_devices if isinstance(d, dict) and d.get("serial")]
+            missing_serials = [s for s in snapshot_serials if s not in current_serials]
+            if missing_serials:
+                dashboard.networks.claimNetworkDevices(network_id, serials=missing_serials)
+                print(f"[RESTORE] Claimed missing devices: {len(missing_serials)}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Add devices (claim missing serials): {e}")
+
+
+# ==============================
+# 🔥 FULL DEEP RESTORE (ENTERPRISE)
+# ==============================
+def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
+    security_root = os.path.join(network_folder, "security_sdwan")
+    if not os.path.exists(security_root):
+        print("[RESTORE SKIP] No security_sdwan folder")
+        return
+
+    # Addressing & VLANs / DHCP
+    firmware = _load_json_if_exists(os.path.join(security_root, "firmware_upgrades.json"))
+    if firmware:
+        try:
+            dashboard.networks.updateNetworkFirmwareUpgrades(network_id, **firmware)
+            print("[RESTORE] MX firmware upgrades policy restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] MX firmware upgrades policy: {e}")
+
+    appliance_settings = _load_json_if_exists(os.path.join(security_root, "appliance_settings.json"))
+    if appliance_settings:
+        try:
+            dashboard.appliance.updateNetworkApplianceSettings(network_id, **appliance_settings)
+            print("[RESTORE] Appliance settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Appliance settings: {e}")
+
+    single_lan = _load_json_if_exists(os.path.join(security_root, "single_lan.json"))
+    if single_lan:
+        try:
+            dashboard.appliance.updateNetworkApplianceSingleLan(network_id, **single_lan)
+            print("[RESTORE] Single LAN restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Single LAN: {e}")
+
+    vlans_settings = _load_json_if_exists(os.path.join(security_root, "vlans_settings.json"))
+    if vlans_settings:
+        try:
+            dashboard.appliance.updateNetworkApplianceVlansSettings(network_id, **vlans_settings)
+            print("[RESTORE] VLAN settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] VLAN settings: {e}")
+
+    vlans = _load_json_if_exists(os.path.join(security_root, "vlans.json")) or []
+    existing_vlans = []
+    try:
+        existing_vlans = dashboard.appliance.getNetworkApplianceVlans(network_id)
+    except Exception:
+        pass
+    existing_vlan_ids = {str(v.get("id")) for v in existing_vlans}
+
+    for vlan in vlans:
+        vlan_id = vlan.get("id")
+        if vlan_id is None:
+            continue
+        try:
+            if str(vlan_id) in existing_vlan_ids:
+                dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **vlan)
+            else:
+                create_vlan_payload = dict(vlan)
+                create_vlan_payload.pop("id", None)
+                create_vlan_payload.pop("name", None)
+                dashboard.appliance.createNetworkApplianceVlan(
+                    network_id,
+                    id=vlan_id,
+                    name=vlan.get("name", f"VLAN {vlan_id}"),
+                    **create_vlan_payload
+                )
+            print(f"[RESTORE] VLAN restored: {vlan_id}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] VLAN {vlan_id}: {e}")
+
+    ports = _load_json_if_exists(os.path.join(security_root, "ports.json")) or []
+    for port in ports:
+        port_id = port.get("number") or port.get("portId")
+        if port_id is None:
+            continue
+        try:
+            dashboard.appliance.updateNetworkAppliancePort(network_id, port_id, **port)
+        except Exception as e:
+            print(f"[RESTORE ERROR] MX port {port_id}: {e}")
+
+    # Firewall
+    fw_l3 = _load_json_if_exists(os.path.join(security_root, "firewall_l3.json"))
+    if fw_l3:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallL3FirewallRules(network_id, **fw_l3)
+            print("[RESTORE] Firewall L3 restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Firewall L3: {e}")
+
+    fw_l7 = _load_json_if_exists(os.path.join(security_root, "firewall_l7.json"))
+    if fw_l7:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallL7FirewallRules(network_id, **fw_l7)
+            print("[RESTORE] Firewall L7 restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Firewall L7: {e}")
+
+    one_to_many = _load_json_if_exists(os.path.join(security_root, "firewall_one_to_many_nat.json"))
+    if one_to_many and isinstance(one_to_many, dict):
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallOneToManyNatRules(
+                network_id,
+                rules=one_to_many.get("rules", [])
+            )
+            print("[RESTORE] Firewall 1:Many NAT restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Firewall 1:Many NAT: {e}")
+
+    one_to_one = _load_json_if_exists(os.path.join(security_root, "firewall_one_to_one_nat.json"))
+    if one_to_one and isinstance(one_to_one, dict):
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallOneToOneNatRules(
+                network_id,
+                rules=one_to_one.get("rules", [])
+            )
+            print("[RESTORE] Firewall 1:1 NAT restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Firewall 1:1 NAT: {e}")
+
+    inbound_fw = _load_json_if_exists(os.path.join(security_root, "firewall_inbound.json"))
+    if inbound_fw:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallInboundFirewallRules(network_id, **inbound_fw)
+            print("[RESTORE] Inbound firewall restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Inbound firewall: {e}")
+
+    pfw = _load_json_if_exists(os.path.join(security_root, "firewall_port_forwarding.json"))
+    if pfw and isinstance(pfw, dict):
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallPortForwardingRules(
+                network_id,
+                rules=pfw.get("rules", [])
+            )
+            print("[RESTORE] Port forwarding restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Port forwarding: {e}")
+
+    cfw = _load_json_if_exists(os.path.join(security_root, "firewall_cellular.json"))
+    if cfw:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallCellularFirewallRules(network_id, **cfw)
+            print("[RESTORE] Cellular firewall restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Cellular firewall: {e}")
+
+    icfw = _load_json_if_exists(os.path.join(security_root, "firewall_inbound_cellular.json"))
+    if icfw:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallInboundCellularFirewallRules(network_id, **icfw)
+            print("[RESTORE] Inbound cellular firewall restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Inbound cellular firewall: {e}")
+
+    fw_settings = _load_json_if_exists(os.path.join(security_root, "firewall_settings.json"))
+    if fw_settings:
+        try:
+            dashboard.appliance.updateNetworkApplianceFirewallSettings(network_id, **fw_settings)
+            print("[RESTORE] Firewall settings restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Firewall settings: {e}")
+
+    # Site-to-site VPN / Routing
+    s2s = _load_json_if_exists(os.path.join(security_root, "vpn_site_to_site.json"))
+    if s2s:
+        try:
+            s2s_payload = dict(s2s)
+            s2s_mode = s2s_payload.pop("mode", "none")
+            dashboard.appliance.updateNetworkApplianceVpnSiteToSiteVpn(
+                network_id,
+                mode=s2s_mode,
+                **s2s_payload
+            )
+            print("[RESTORE] Site-to-site VPN restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Site-to-site VPN: {e}")
+
+    bgp = _load_json_if_exists(os.path.join(security_root, "vpn_bgp.json"))
+    if bgp and "enabled" in bgp:
+        try:
+            bgp_payload = dict(bgp)
+            bgp_enabled = bgp_payload.pop("enabled", False)
+            dashboard.appliance.updateNetworkApplianceVpnBgp(
+                network_id,
+                enabled=bgp_enabled,
+                **bgp_payload
+            )
+            print("[RESTORE] VPN BGP restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] VPN BGP: {e}")
+
+    static_routes = _load_json_if_exists(os.path.join(security_root, "routing_static_routes.json")) or []
+    existing_routes = []
+    try:
+        existing_routes = dashboard.appliance.getNetworkApplianceStaticRoutes(network_id)
+    except Exception:
+        pass
+    existing_route_by_name = {r.get("name"): r for r in existing_routes if r.get("name")}
+
+    for route in static_routes:
+        route_id = route.get("staticRouteId")
+        route_name = route.get("name")
+        try:
+            if route_id:
+                dashboard.appliance.updateNetworkApplianceStaticRoute(network_id, route_id, **route)
+            elif route_name and route_name in existing_route_by_name:
+                dashboard.appliance.updateNetworkApplianceStaticRoute(
+                    network_id,
+                    existing_route_by_name[route_name].get("staticRouteId"),
+                    **route
+                )
+            elif route.get("name") and route.get("subnet") and route.get("gatewayIp"):
+                create_route_payload = dict(route)
+                create_route_payload.pop("name", None)
+                create_route_payload.pop("subnet", None)
+                create_route_payload.pop("gatewayIp", None)
+                dashboard.appliance.createNetworkApplianceStaticRoute(
+                    network_id,
+                    name=route.get("name"),
+                    subnet=route.get("subnet"),
+                    gatewayIp=route.get("gatewayIp"),
+                    **create_route_payload
+                )
+            print(f"[RESTORE] Static route restored: {route_name}")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Static route {route_name}: {e}")
+
+    # SD-WAN & Traffic Shaping
+    tsh = _load_json_if_exists(os.path.join(security_root, "traffic_shaping.json"))
+    if tsh:
+        try:
+            dashboard.appliance.updateNetworkApplianceTrafficShaping(network_id, **tsh)
+            print("[RESTORE] Traffic shaping restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Traffic shaping: {e}")
+
+    tsh_rules = _load_json_if_exists(os.path.join(security_root, "traffic_shaping_rules.json"))
+    if tsh_rules:
+        try:
+            dashboard.appliance.updateNetworkApplianceTrafficShapingRules(network_id, **tsh_rules)
+            print("[RESTORE] Traffic shaping rules restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Traffic shaping rules: {e}")
+
+    uplink_bw = _load_json_if_exists(os.path.join(security_root, "traffic_shaping_uplink_bandwidth.json"))
+    if uplink_bw:
+        try:
+            dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkBandwidth(network_id, **uplink_bw)
+            print("[RESTORE] Uplink bandwidth restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Uplink bandwidth: {e}")
+
+    uplink_sel = _load_json_if_exists(os.path.join(security_root, "traffic_shaping_uplink_selection.json"))
+    if uplink_sel:
+        try:
+            dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkSelection(network_id, **uplink_sel)
+            print("[RESTORE] Uplink selection restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Uplink selection: {e}")
+
+    # Threat protection / content filtering
+    content = _load_json_if_exists(os.path.join(security_root, "content_filtering.json"))
+    if content:
+        try:
+            content_payload = dict(content) if isinstance(content, dict) else {}
+            blocked_categories = []
+            for item in _ensure_list(content_payload.get("blockedUrlCategories")):
+                if isinstance(item, str):
+                    blocked_categories.append(item)
+                elif isinstance(item, dict):
+                    cid = item.get("id") or item.get("name")
+                    if isinstance(cid, str):
+                        blocked_categories.append(cid)
+            content_payload["blockedUrlCategories"] = blocked_categories
+            content_payload["blockedUrlPatterns"] = [
+                x for x in _ensure_list(content_payload.get("blockedUrlPatterns")) if isinstance(x, str)
+            ]
+            content_payload["allowedUrlPatterns"] = [
+                x for x in _ensure_list(content_payload.get("allowedUrlPatterns")) if isinstance(x, str)
+            ]
+            dashboard.appliance.updateNetworkApplianceContentFiltering(network_id, **content_payload)
+            print("[RESTORE] Content filtering restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Content filtering: {e}")
+
+    malware = _load_json_if_exists(os.path.join(security_root, "security_malware.json"))
+    if malware and "mode" in malware:
+        try:
+            malware_payload = dict(malware)
+            malware_mode = malware_payload.pop("mode", None)
+            dashboard.appliance.updateNetworkApplianceSecurityMalware(
+                network_id,
+                mode=malware_mode,
+                **malware_payload
+            )
+            print("[RESTORE] Malware protection restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Malware protection: {e}")
+
+    intrusion = _load_json_if_exists(os.path.join(security_root, "security_intrusion.json"))
+    if intrusion:
+        try:
+            dashboard.appliance.updateNetworkApplianceSecurityIntrusion(network_id, **intrusion)
+            print("[RESTORE] Intrusion protection restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Intrusion protection: {e}")
+
+    warm_spare = _load_json_if_exists(os.path.join(security_root, "warm_spare.json"))
+    if warm_spare and "enabled" in warm_spare:
+        try:
+            warm_spare_payload = dict(warm_spare)
+            warm_spare_enabled = warm_spare_payload.pop("enabled", False)
+            spare_serial = warm_spare_payload.get("spareSerial")
+            if spare_serial is None or spare_serial == "":
+                warm_spare_payload.pop("spareSerial", None)
+            elif not _is_valid_meraki_serial(spare_serial):
+                print("[RESTORE WARN] Warm spare skipped: invalid spareSerial in snapshot")
+                warm_spare_payload.pop("spareSerial", None)
+                warm_spare_enabled = False
+            dashboard.appliance.updateNetworkApplianceWarmSpare(
+                network_id,
+                enabled=warm_spare_enabled,
+                **warm_spare_payload
+            )
+            print("[RESTORE] Warm spare restored")
+        except Exception as e:
+            print(f"[RESTORE ERROR] Warm spare: {e}")
+
+    # Wireless concentrator related (if available in MX mode)
+    mx_ssids = _load_json_if_exists(os.path.join(security_root, "mx_ssids.json")) or []
+    for ssid in mx_ssids:
+        number = ssid.get("number")
+        if number is None:
+            continue
+        try:
+            dashboard.appliance.updateNetworkApplianceSsid(network_id, number, **ssid)
+        except Exception:
+            pass
+
+    mx_rf_profiles = _load_json_if_exists(os.path.join(security_root, "mx_rf_profiles.json")) or []
+    for profile in mx_rf_profiles:
+        rf_profile_id = profile.get("id")
+        if not rf_profile_id:
+            continue
+        try:
+            dashboard.appliance.updateNetworkApplianceRfProfile(network_id, rf_profile_id, **profile)
+        except Exception:
+            pass
+
+    print("[RESTORE DONE] Security & SD-WAN restore completed")
+
+
+def fullDeepRestore(network_id, network_folder, dashboard, org_id=None, target_network=None):
+    """
+    Enterprise Disaster Recovery Restore Order:
+    1. Network-wide
+    2. Wireless
+    3. SSIDs
+    4. Switch
+    """
+    print("========== FULL DEEP RESTORE START ==========")
+
+    restoreNetworkWide(network_id, network_folder, dashboard)
+    restoreSecuritySdwanSettings(network_id, network_folder, dashboard)
+    restoreWirelessComplete(network_id, network_folder, dashboard)
+    restoreSwitch(
+        network_id,
+        network_folder,
+        dashboard,
+        org_id=org_id,
+        target_network=target_network
+    )
+
+    print("========== FULL DEEP RESTORE COMPLETED ==========")

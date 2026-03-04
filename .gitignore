@@ -2,6 +2,7 @@
 # Security (สำคัญมาก)
 # ========================
 config.py
+!config.example.py
 .env
 *.env
 

@@ -1,0 +1,762 @@
+﻿from flask import Flask, render_template, request, redirect, url_for, flash
+import meraki
+import config
+import os
+import csv
+import json
+import threading
+import datetime as dt
+
+from backupFunctions import (
+    backupWirelessComplete,
+    backupSecuritySdwanSettings,
+    backupSwitchSettings,
+    backupSyslogSettings,
+)
+from restoreFunctions import (
+    restoreWirelessComplete,
+    restoreSecuritySdwanSettings,
+    restoreSwitch,
+    restoreNetworkWide,
+    fullDeepRestore,
+)
+
+app = Flask(__name__)
+app.secret_key = "meraki_enterprise_secret_key"
+
+# ===== MERAKI DASHBOARD =====
+dashboard = meraki.DashboardAPI(
+    config.API_KEY,
+    suppress_logging=False
+)
+
+# ===== GLOBAL STATE =====
+operation_logs = []
+MAX_LOGS = 500
+is_backup_running = False
+is_restore_running = False
+
+
+def add_log(message: str):
+    timestamp = dt.datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+
+    operation_logs.append(log_entry)
+
+    if len(operation_logs) > MAX_LOGS:
+        operation_logs.pop(0)
+
+    print(f"[WEB LOG] {message}")
+
+
+def create_snapshot_folder(org_name: str):
+    timestamp = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    safe_org = org_name.replace(" ", "_").replace(",", "")
+    snapshot_name = f"{safe_org}_{timestamp}"
+
+    snapshot_path = os.path.join(config.backup_directory, snapshot_name)
+    os.makedirs(snapshot_path, exist_ok=True)
+
+    return snapshot_path, snapshot_name
+
+
+def get_all_snapshots():
+    backup_root = config.backup_directory
+
+    if not os.path.exists(backup_root):
+        return []
+
+    snapshots = sorted(
+        [
+            f for f in os.listdir(backup_root)
+            if os.path.isdir(os.path.join(backup_root, f))
+        ],
+        reverse=True
+    )
+
+    return snapshots
+
+
+def create_export_folder(org_name: str):
+    timestamp = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    safe_org = org_name.replace(" ", "_").replace(",", "")
+    export_root = os.path.join(config.backup_directory, "exports")
+    os.makedirs(export_root, exist_ok=True)
+
+    export_name = f"{safe_org}_{timestamp}"
+    export_path = os.path.join(export_root, export_name)
+    os.makedirs(export_path, exist_ok=True)
+    return export_path, export_name
+
+
+def _csv_cell(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return value
+
+
+def write_csv_records(file_path: str, rows: list):
+    headers = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                headers.append(key)
+
+    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _csv_cell(row.get(k)) for k in headers})
+
+
+def normalize_network_name(name: str) -> str:
+    return (name or "").strip().lower().replace(" ", "_")
+
+
+def find_latest_snapshot_folder_for_network(network_name: str):
+    snapshots = get_all_snapshots()
+    if not snapshots:
+        return None, None
+
+    target_normalized = normalize_network_name(network_name)
+    for snap in snapshots:
+        snapshot_network_root = os.path.join(
+            config.backup_directory,
+            snap,
+            "network"
+        )
+        if not os.path.exists(snapshot_network_root):
+            continue
+
+        for folder in os.listdir(snapshot_network_root):
+            if normalize_network_name(folder) == target_normalized:
+                return os.path.join(snapshot_network_root, folder), snap
+
+    return None, None
+
+
+def snapshot_has_mode_data(network_folder: str, backup_mode: str) -> bool:
+    """
+    Check whether the selected snapshot folder has data for the requested restore mode.
+    """
+    if not network_folder or not os.path.exists(network_folder):
+        return False
+
+    if backup_mode == "wireless":
+        return os.path.exists(os.path.join(network_folder, "wireless"))
+    if backup_mode == "security_sdwan":
+        return os.path.exists(os.path.join(network_folder, "security_sdwan"))
+    if backup_mode == "switching":
+        return os.path.exists(os.path.join(network_folder, "switch"))
+    if backup_mode == "network_wide":
+        return os.path.exists(os.path.join(network_folder, "network_wide"))
+
+    # full_enterprise: require at least one major component folder
+    return any(
+        os.path.exists(os.path.join(network_folder, component))
+        for component in ("wireless", "security_sdwan", "switch", "network_wide")
+    )
+
+
+def find_latest_snapshot_folder_for_network_and_mode(network_name: str, backup_mode: str):
+    snapshots = get_all_snapshots()
+    if not snapshots:
+        return None, None
+
+    target_normalized = normalize_network_name(network_name)
+    for snap in snapshots:
+        snapshot_network_root = os.path.join(
+            config.backup_directory,
+            snap,
+            "network"
+        )
+        if not os.path.exists(snapshot_network_root):
+            continue
+
+        for folder in os.listdir(snapshot_network_root):
+            if normalize_network_name(folder) != target_normalized:
+                continue
+
+            candidate = os.path.join(snapshot_network_root, folder)
+            if snapshot_has_mode_data(candidate, backup_mode):
+                return candidate, snap
+
+    return None, None
+
+
+def find_snapshot_folder_for_network_and_mode(snapshot_name: str, network_name: str, backup_mode: str):
+    if not snapshot_name:
+        return None, None
+
+    snapshot_network_root = os.path.join(
+        config.backup_directory,
+        snapshot_name,
+        "network"
+    )
+    if not os.path.exists(snapshot_network_root):
+        return None, None
+
+    target_normalized = normalize_network_name(network_name)
+    for folder in os.listdir(snapshot_network_root):
+        if normalize_network_name(folder) != target_normalized:
+            continue
+        candidate = os.path.join(snapshot_network_root, folder)
+        if snapshot_has_mode_data(candidate, backup_mode):
+            return candidate, snapshot_name
+
+    return None, None
+
+
+def resolve_target_networks(org_id: str, network_id: str):
+    org_networks = dashboard.organizations.getOrganizationNetworks(org_id)
+    if network_id == "__all__":
+        return org_networks
+
+    for net in org_networks:
+        if net["id"] == network_id:
+            return [net]
+
+    raise Exception("Cannot find target network from API")
+
+
+def enrich_network_with_details(network: dict):
+    """
+    Ensure fields like configTemplateId are present by fetching network detail.
+    """
+    network_id = network.get("id")
+    if not network_id:
+        return network
+    try:
+        detail = dashboard.networks.getNetwork(network_id)
+        merged = dict(network)
+        merged.update(detail or {})
+        return merged
+    except Exception:
+        return network
+
+
+def log_template_binding_status(network: dict):
+    network_name = network.get("name", network.get("id", "Unknown"))
+    config_template_id = network.get("configTemplateId")
+    if config_template_id:
+        add_log(
+            f"Template Binding: {network_name} is bound to config template ({config_template_id})"
+        )
+    else:
+        add_log(f"Template Binding: {network_name} is not bound to config template")
+
+
+def export_clients_usage_csv(org_id: str, org_name: str, network_id: str):
+    target_networks = resolve_target_networks(org_id, network_id)
+    export_path, export_name = create_export_folder(org_name)
+
+    client_rows = []
+    usage_rows = []
+
+    for target_network in target_networks:
+        target_net_id = target_network["id"]
+        target_net_name = target_network["name"]
+        add_log(f"Exporting client list for: {target_net_name}")
+
+        try:
+            clients = dashboard.networks.getNetworkClients(
+                target_net_id,
+                timespan=7 * 24 * 60 * 60,
+                perPage=1000,
+                total_pages="all"
+            )
+        except Exception as e:
+            add_log(f"Client export skipped ({target_net_name}): {e}")
+            continue
+
+        for client in clients:
+            row = {
+                "networkId": target_net_id,
+                "networkName": target_net_name,
+            }
+            row.update(client)
+            client_rows.append(row)
+
+        client_ids = [c.get("id") or c.get("mac") or c.get("ip") for c in clients]
+        client_ids = [cid for cid in client_ids if cid]
+
+        chunk_size = 100
+        for i in range(0, len(client_ids), chunk_size):
+            chunk = client_ids[i:i + chunk_size]
+            try:
+                usage_items = dashboard.networks.getNetworkClientsUsageHistories(
+                    target_net_id,
+                    clients=",".join(chunk),
+                    timespan=7 * 24 * 60 * 60,
+                    perPage=1000,
+                    total_pages="all"
+                )
+            except Exception as e:
+                add_log(f"Usage history export skipped chunk ({target_net_name}): {e}")
+                continue
+
+            for item in usage_items:
+                row = {
+                    "networkId": target_net_id,
+                    "networkName": target_net_name,
+                }
+                row.update(item)
+                usage_rows.append(row)
+
+    if client_rows:
+        write_csv_records(os.path.join(export_path, "client_list.csv"), client_rows)
+    if usage_rows:
+        write_csv_records(os.path.join(export_path, "client_usage_history.csv"), usage_rows)
+
+    return export_name, export_path, len(client_rows), len(usage_rows)
+
+
+def export_sm_inventory_csv(org_id: str, org_name: str, network_id: str):
+    target_networks = resolve_target_networks(org_id, network_id)
+    export_path, export_name = create_export_folder(org_name)
+
+    device_rows = []
+    user_rows = []
+    unsupported_networks = 0
+
+    sm_device_fields = [
+        "ownerEmail",
+        "ownerUsername",
+        "lastUser",
+        "ip",
+        "publicIp",
+        "systemType",
+        "osName",
+        "serialNumber",
+        "tags",
+        "url",
+    ]
+
+    for target_network in target_networks:
+        target_net_id = target_network["id"]
+        target_net_name = target_network["name"]
+        add_log(f"Exporting SM inventory for: {target_net_name}")
+
+        try:
+            devices = dashboard.sm.getNetworkSmDevices(
+                target_net_id,
+                fields=sm_device_fields,
+                perPage=1000,
+                total_pages="all"
+            )
+            for device in devices:
+                row = {
+                    "networkId": target_net_id,
+                    "networkName": target_net_name,
+                }
+                row.update(device)
+                device_rows.append(row)
+        except Exception as e:
+            error_text = str(e).lower()
+            if (
+                "only supports systems manager network" in error_text
+                or "does not contain a systems manager network" in error_text
+            ):
+                unsupported_networks += 1
+                add_log(
+                    f"SM device export skipped ({target_net_name}): this network is not Systems Manager-enabled"
+                )
+            else:
+                add_log(f"SM device export failed ({target_net_name})")
+
+        try:
+            users = dashboard.sm.getNetworkSmUsers(target_net_id)
+            for user in users:
+                row = {
+                    "networkId": target_net_id,
+                    "networkName": target_net_name,
+                }
+                row.update(user)
+                user_rows.append(row)
+        except Exception as e:
+            error_text = str(e).lower()
+            if "does not contain a systems manager network" in error_text:
+                add_log(
+                    f"SM user export skipped ({target_net_name}): this network is not Systems Manager-enabled"
+                )
+            else:
+                add_log(f"SM user export failed ({target_net_name})")
+
+    if device_rows:
+        write_csv_records(os.path.join(export_path, "sm_device_inventory.csv"), device_rows)
+    if user_rows:
+        write_csv_records(os.path.join(export_path, "sm_users.csv"), user_rows)
+
+    return export_name, export_path, len(device_rows), len(user_rows), unsupported_networks
+
+
+def run_full_backup(org_id: str, network_id: str, backup_mode: str = "full_enterprise"):
+    global is_backup_running
+
+    try:
+        is_backup_running = True
+        add_log("Starting Backup (Snapshot Mode)")
+        add_log(f"Backup Mode: {backup_mode}")
+
+        orgs = dashboard.organizations.getOrganizations()
+        target_org = None
+
+        for org in orgs:
+            if str(org["id"]) == str(org_id):
+                target_org = org
+                break
+
+        if not target_org:
+            raise Exception("Organization not found from API")
+
+        org_name = target_org["name"]
+        add_log(f"Target Organization: {org_name}")
+
+        snapshot_path, snapshot_name = create_snapshot_folder(org_name)
+        add_log(f"Created Snapshot: {snapshot_name}")
+
+        networks = dashboard.organizations.getOrganizationNetworks(org_id)
+        if network_id == "__all__":
+            target_networks = networks
+            add_log(f"Backing up ALL networks in org ({len(target_networks)} total)")
+        else:
+            target_network = None
+            for net in networks:
+                if net["id"] == network_id:
+                    target_network = net
+                    break
+
+            if not target_network:
+                raise Exception("Target Network not found")
+
+            target_networks = [target_network]
+            add_log(f"Backing up Network: {target_network['name']}")
+
+        class DummyLogger:
+            def info(self, msg):
+                print(f"[LOGGER INFO] {msg}")
+
+            def error(self, msg):
+                print(f"[LOGGER ERROR] {msg}")
+
+            def warning(self, msg):
+                print(f"[LOGGER WARNING] {msg}")
+
+        logger = DummyLogger()
+
+        for target_network in target_networks:
+            target_network = enrich_network_with_details(target_network)
+            net_name = target_network.get("name", target_network.get("id", "Unknown"))
+            log_template_binding_status(target_network)
+            add_log(f"Processing backup for network: {net_name}")
+
+            if backup_mode in ("wireless", "full_enterprise"):
+                try:
+                    add_log("Backing up Wireless (full scope)...")
+                    backupWirelessComplete(
+                        target_network,
+                        snapshot_path,
+                        dashboard,
+                        logger,
+                        org_id=org_id
+                    )
+                except Exception as e:
+                    add_log(f"Wireless Backup Skipped ({net_name}): {str(e)}")
+
+            if backup_mode in ("security_sdwan", "full_enterprise"):
+                try:
+                    add_log("Backing up Security & SD-WAN settings...")
+                    backupSecuritySdwanSettings(target_network, snapshot_path, dashboard, logger)
+                except Exception as e:
+                    add_log(f"Security & SD-WAN Backup Skipped ({net_name}): {str(e)}")
+
+            if backup_mode in ("switching", "full_enterprise"):
+                try:
+                    add_log("Backing up Switch Settings...")
+                    backupSwitchSettings(
+                        target_network,
+                        snapshot_path,
+                        dashboard,
+                        logger,
+                        org_id=org_id
+                    )
+                except Exception as e:
+                    add_log(f"Switch Backup Skipped ({net_name}): {str(e)}")
+
+            if backup_mode in ("network_wide", "full_enterprise"):
+                try:
+                    add_log("Backing up Network-wide Settings...")
+                    backupSyslogSettings(target_network, snapshot_path, dashboard, logger)
+                except Exception as e:
+                    add_log(f"Network-wide Backup Skipped ({net_name}): {str(e)}")
+
+        # Switching mode bundles CSV exports per user workflow.
+        if backup_mode == "switching":
+            try:
+                add_log("Running bundled Switching export: Clients + Usage CSV...")
+                export_name, export_path, client_count, usage_count = export_clients_usage_csv(
+                    org_id,
+                    org_name,
+                    network_id
+                )
+                add_log(
+                    f"Client/Usage CSV Export Completed: {export_name} "
+                    f"(clients={client_count}, usage={usage_count}, path={export_path})"
+                )
+            except Exception as e:
+                add_log(f"Client/Usage Export Error: {e}")
+
+            try:
+                add_log("Running bundled Switching export: SM Inventory CSV...")
+                export_name, export_path, device_count, user_count, unsupported_networks = export_sm_inventory_csv(
+                    org_id,
+                    org_name,
+                    network_id
+                )
+                if device_count == 0 and user_count == 0 and unsupported_networks > 0:
+                    add_log("SM Inventory export skipped: selected network(s) are not Systems Manager-enabled")
+                else:
+                    add_log(
+                        f"SM Inventory CSV Export Completed: {export_name} "
+                        f"(devices={device_count}, users={user_count}, path={export_path})"
+                    )
+            except Exception as e:
+                add_log(f"SM Inventory Export Error: {e}")
+
+        add_log("Backup Snapshot Completed Successfully")
+
+    except Exception as e:
+        add_log(f"Backup Error: {str(e)}")
+
+    finally:
+        is_backup_running = False
+        add_log("Backup Job Finished")
+
+
+def run_full_restore(
+    org_id: str,
+    network_id: str,
+    backup_mode: str = "full_enterprise",
+    selected_snapshot_name: str = ""
+):
+    global is_restore_running
+
+    try:
+        is_restore_running = True
+        add_log("===== RESTORE STARTED =====")
+        add_log(f"Restore Mode: {backup_mode}")
+        if selected_snapshot_name:
+            add_log(f"Restore Snapshot Selection: {selected_snapshot_name}")
+        else:
+            add_log("Restore Snapshot Selection: latest matching snapshot (auto)")
+        target_networks = resolve_target_networks(org_id, network_id)
+        if network_id == "__all__":
+            add_log(f"Restoring ALL networks in org ({len(target_networks)} total)")
+
+        restored_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        for target_network in target_networks:
+            try:
+                target_network = enrich_network_with_details(target_network)
+                target_net_name = target_network["name"]
+                target_net_id = target_network["id"]
+                log_template_binding_status(target_network)
+
+                if selected_snapshot_name:
+                    target_folder, selected_snapshot = find_snapshot_folder_for_network_and_mode(
+                        selected_snapshot_name,
+                        target_net_name,
+                        backup_mode
+                    )
+                else:
+                    target_folder, selected_snapshot = find_latest_snapshot_folder_for_network_and_mode(
+                        target_net_name,
+                        backup_mode
+                    )
+                if not target_folder:
+                    if selected_snapshot_name:
+                        add_log(
+                            f"Restore skipped (snapshot {selected_snapshot_name} has no {backup_mode} data): "
+                            f"{target_net_name}"
+                        )
+                    else:
+                        add_log(f"Restore skipped (no {backup_mode} snapshot data): {target_net_name}")
+                    skipped_count += 1
+                    continue
+
+                if selected_snapshot_name:
+                    add_log(f"Using Selected Snapshot: {selected_snapshot}")
+                else:
+                    add_log(f"Using Latest Matching Snapshot: {selected_snapshot}")
+                add_log(f"Restoring for network: {target_net_name}")
+
+                if backup_mode == "wireless":
+                    restoreWirelessComplete(target_net_id, target_folder, dashboard)
+                elif backup_mode == "security_sdwan":
+                    restoreSecuritySdwanSettings(target_net_id, target_folder, dashboard)
+                elif backup_mode == "switching":
+                    restoreSwitch(
+                        target_net_id,
+                        target_folder,
+                        dashboard,
+                        org_id=org_id,
+                        target_network=target_network
+                    )
+                elif backup_mode == "network_wide":
+                    restoreNetworkWide(target_net_id, target_folder, dashboard)
+                else:
+                    fullDeepRestore(
+                        target_net_id,
+                        target_folder,
+                        dashboard,
+                        org_id=org_id,
+                        target_network=target_network
+                    )
+
+                restored_count += 1
+
+            except Exception as e:
+                failed_count += 1
+                add_log(f"Restore failed for network {target_network.get('name', 'Unknown')}: {e}")
+
+        if failed_count > 0:
+            add_log(
+                f"RESTORE COMPLETED WITH ERRORS: restored={restored_count}, "
+                f"skipped={skipped_count}, failed={failed_count}"
+            )
+        else:
+            add_log(f"RESTORE SUCCESS (Snapshot Applied): restored={restored_count}, skipped={skipped_count}")
+
+    except Exception as e:
+        add_log(f"Restore Error: {str(e)}")
+
+    finally:
+        is_restore_running = False
+        add_log("Restore Job Finished")
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    orgs = []
+    networks = []
+    snapshots = get_all_snapshots()
+
+    selected_org = request.values.get("org_id")
+    selected_network = request.values.get("network_id")
+    selected_snapshot = request.values.get("snapshot_name", "")
+
+    try:
+        orgs = dashboard.organizations.getOrganizations()
+        add_log("Loaded Organizations from Meraki API")
+    except Exception as e:
+        add_log(f"Error loading organizations: {str(e)}")
+
+    if not selected_org and orgs:
+        selected_org = str(orgs[0]["id"])
+
+    if selected_org:
+        try:
+            networks = dashboard.organizations.getOrganizationNetworks(selected_org)
+            add_log(f"Selected Org ID: {selected_org}")
+            add_log(f"Found {len(networks)} networks in organization")
+
+            if not selected_network and networks:
+                selected_network = networks[0]["id"]
+        except Exception as e:
+            add_log(f"Error loading networks: {str(e)}")
+
+    return render_template(
+        "index.html",
+        orgs=orgs,
+        networks=networks,
+        selected_org=selected_org,
+        selected_network=selected_network,
+        selected_snapshot=selected_snapshot,
+        snapshots=snapshots,
+        logs=operation_logs,
+        is_backup_running=is_backup_running,
+        is_restore_running=is_restore_running
+    )
+
+
+@app.route("/execute_action", methods=["POST"])
+def execute_action():
+    global is_backup_running, is_restore_running
+
+    org_id = request.form.get("org_id")
+    network_id = request.form.get("network_id")
+    action = request.form.get("action")
+    backup_mode = request.form.get("backup_mode", "full_enterprise")
+    snapshot_name = (request.form.get("snapshot_name") or "").strip()
+
+    if not org_id or not network_id:
+        flash("กรุณาเลือก Organization และ Network ก่อน", "danger")
+        return redirect(url_for("index", org_id=org_id or "", network_id=network_id or ""))
+
+    try:
+        orgs = dashboard.organizations.getOrganizations()
+    except Exception:
+        orgs = []
+    target_org = next((org for org in orgs if str(org["id"]) == str(org_id)), None)
+    org_name = target_org["name"] if target_org else f"org_{org_id}"
+
+    if action == "backup":
+        if is_backup_running:
+            flash("Backup กำลังทำงานอยู่", "warning")
+            return redirect(url_for("index", org_id=org_id, network_id=network_id))
+
+        if is_restore_running:
+            flash("Restore กำลังทำงานอยู่", "warning")
+            return redirect(url_for("index", org_id=org_id, network_id=network_id))
+
+        add_log("Manual Backup Triggered (Full Snapshot from Dashboard)")
+
+        thread = threading.Thread(
+            target=run_full_backup,
+            args=(org_id, network_id, backup_mode)
+        )
+        thread.daemon = True
+        thread.start()
+
+        flash("Full Backup Snapshot Started", "info")
+
+    elif action == "restore":
+        if is_restore_running:
+            flash("Restore กำลังทำงานอยู่", "warning")
+            return redirect(url_for("index", org_id=org_id, network_id=network_id))
+
+        if is_backup_running:
+            flash("Backup กำลังทำงานอยู่", "warning")
+            return redirect(url_for("index", org_id=org_id, network_id=network_id))
+
+        thread = threading.Thread(
+            target=run_full_restore,
+            args=(org_id, network_id, backup_mode, snapshot_name)
+        )
+        thread.daemon = True
+        thread.start()
+
+        if snapshot_name:
+            flash(f"Restore Started (Snapshot: {snapshot_name})", "info")
+        else:
+            flash("Restore Started (Latest matching snapshot)", "info")
+
+    return redirect(
+        url_for(
+            "index",
+            org_id=org_id,
+            network_id=network_id,
+            snapshot_name=snapshot_name
+        )
+    )
+
+
+if __name__ == "__main__":
+    add_log("Meraki Enterprise Backup & Restore Dashboard Started")
+    app.run(host="0.0.0.0", port=5000, debug=True)

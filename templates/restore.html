@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Meraki Restore - Enterprise UI</title>
+    <style>
+        body {
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background-color: #f4f6f9;
+            margin: 0;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 30px auto;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #2c3e50;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        }
+
+        .menu-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #34495e;
+        }
+
+        .restore-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .restore-btn {
+            border: none;
+            padding: 18px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.2s;
+            width: 100%;
+        }
+
+        .restore-btn:hover {
+            transform: scale(1.02);
+        }
+
+        .wireless { background: #3498db; color: white; }
+        .switch { background: #16a085; color: white; }
+        .network { background: #7f8c8d; color: white; }
+        .full { background: #e74c3c; color: white; }
+
+        .warning {
+            background: #fff3cd;
+            border-left: 6px solid #ffc107;
+            padding: 12px;
+            margin-top: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+
+        select {
+            padding: 10px;
+            border-radius: 8px;
+            width: 100%;
+            margin-top: 10px;
+        }
+
+        .top-info {
+            font-size: 14px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>♻️ Meraki Restore Center (Enterprise UI)</h1>
+
+    <div class="card">
+        <div class="menu-title">📂 Select Snapshot</div>
+        <form method="POST" action="/restore">
+            <input type="hidden" name="network_id" value="{{ network_id }}">
+
+            <label>Available Backup Snapshots:</label>
+            <select name="snapshot" required>
+                {% for s in snapshots %}
+                    <option value="{{ s }}">{{ s }}</option>
+                {% endfor %}
+            </select>
+
+            <div class="menu-title" style="margin-top:25px;">
+                🧩 Select Restore Scope (เหมือนเมนู Meraki)
+            </div>
+
+            <div class="restore-grid">
+                <button class="restore-btn wireless" name="component" value="wireless">
+                    📡 Wireless<br>
+                    <small>SSID + Security + RF Settings</small>
+                </button>
+
+                <button class="restore-btn switch" name="component" value="switch">
+                    🖧 Switching<br>
+                    <small>Ports + VLAN + Port Config</small>
+                </button>
+
+                <button class="restore-btn network" name="component" value="network">
+                    🌐 Network-wide<br>
+                    <small>Syslog + SNMP + Alerts</small>
+                </button>
+
+                <button class="restore-btn full" name="component" value="all">
+                    🔥 FULL RESTORE<br>
+                    <small>All Components (Disaster Recovery)</small>
+                </button>
+            </div>
+
+            <div class="warning">
+                ⚠️ Enterprise Warning:<br>
+                FULL RESTORE จะกู้ค่าทั้ง Network (Wireless, Switch, Network-wide)<br>
+                แนะนำให้ใช้กับ Lab/Test Network ก่อน Production
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <div class="menu-title">📜 Operation Logs</div>
+        <div style="max-height:300px; overflow:auto; background:#111; color:#0f0; padding:10px; border-radius:8px;">
+            {% for log in logs %}
+                {{ log }}<br>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+</body>
+</html>
