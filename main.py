@@ -16,6 +16,9 @@ from tabulate import tabulate
 import config
 from datetime import datetime
 
+LOG_DIRECTORY = os.path.abspath(config.log_directory)
+os.makedirs(LOG_DIRECTORY, exist_ok=True)
+
 if config.logging_level=="DEBUG":
     level=logging.DEBUG
 elif config.logging_level=="INFO":
@@ -73,7 +76,12 @@ def read_nets(dashboard, operation, org_id, tag):
 
 
 if __name__ == "__main__":
-    dashboard = meraki.DashboardAPI(config.API_KEY, maximum_retries=100, print_console=config.console_logging)
+    dashboard = meraki.DashboardAPI(
+        config.API_KEY,
+        maximum_retries=100,
+        log_path=LOG_DIRECTORY,
+        print_console=config.console_logging
+    )
     print('Welcome to the Meraki Backup and Restore tool. Please select an option:')
     print('1 - Backup my Meraki networks')
     print('2 - Restore my Meraki networks to an existing backup')

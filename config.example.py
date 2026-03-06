@@ -9,6 +9,7 @@ API_KEY = os.getenv("fe008837a4b536f86b53bdfc0a88d8768adfd498")
 backup_tag = ''
 restore_tag = 'merakiRestore'
 backup_directory = './backup'
+log_directory = './logs'
 
 org_number_filter = ['898102']
 org_name_filter = ''

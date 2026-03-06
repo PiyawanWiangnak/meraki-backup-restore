@@ -23,10 +23,14 @@ from restoreFunctions import (
 app = Flask(__name__)
 app.secret_key = "meraki_enterprise_secret_key"
 
+LOG_DIRECTORY = os.path.abspath(config.log_directory)
+os.makedirs(LOG_DIRECTORY, exist_ok=True)
+
 # ===== MERAKI DASHBOARD =====
 dashboard = meraki.DashboardAPI(
     config.API_KEY,
-    suppress_logging=False
+    suppress_logging=False,
+    log_path=LOG_DIRECTORY
 )
 
 # ===== GLOBAL STATE =====
