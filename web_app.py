@@ -6,18 +6,17 @@ import csv
 import json
 import threading
 import datetime as dt
+import re
 
 from backupFunctions import (
     backupWirelessComplete,
     backupSecuritySdwanSettings,
     backupSwitchSettings,
-    backupSyslogSettings,
 )
 from restoreFunctions import (
     restoreWirelessComplete,
     restoreSecuritySdwanSettings,
     restoreSwitch,
-    restoreNetworkWide,
     fullDeepRestore,
 )
 
@@ -37,6 +36,16 @@ is_backup_running = False
 is_restore_running = False
 
 
+ALLOWED_BACKUP_MODES = {"wireless", "security_sdwan", "switching", "full_enterprise"}
+
+
+def normalize_backup_mode(mode: str) -> str:
+    mode_value = (mode or "").strip()
+    if mode_value not in ALLOWED_BACKUP_MODES:
+        return "full_enterprise"
+    return mode_value
+
+
 def add_log(message: str):
     timestamp = dt.datetime.now().strftime("%H:%M:%S")
     log_entry = f"[{timestamp}] {message}"
@@ -49,10 +58,22 @@ def add_log(message: str):
     print(f"[WEB LOG] {message}")
 
 
-def create_snapshot_folder(org_name: str):
-    timestamp = dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    safe_org = org_name.replace(" ", "_").replace(",", "")
-    snapshot_name = f"{safe_org}_{timestamp}"
+def _safe_name(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r'[<>:"/\\|?*]+', "", text)
+    text = text.replace(",", "")
+    text = re.sub(r"\s+", "_", text)
+    return text or "Unknown"
+
+
+def create_snapshot_folder(org_name: str, network_label: str, backup_mode: str):
+    timestamp = dt.datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    safe_org = _safe_name(org_name)
+    if backup_mode == "full_enterprise":
+        snapshot_name = f"{safe_org}_{timestamp}"
+    else:
+        safe_network = _safe_name(network_label)
+        snapshot_name = f"{safe_org}_{safe_network}_{timestamp}"
 
     snapshot_path = os.path.join(config.backup_directory, snapshot_name)
     os.makedirs(snapshot_path, exist_ok=True)
@@ -71,6 +92,7 @@ def get_all_snapshots():
             f for f in os.listdir(backup_root)
             if os.path.isdir(os.path.join(backup_root, f))
         ],
+        key=lambda name: os.path.getmtime(os.path.join(backup_root, name)),
         reverse=True
     )
 
@@ -152,13 +174,11 @@ def snapshot_has_mode_data(network_folder: str, backup_mode: str) -> bool:
         return os.path.exists(os.path.join(network_folder, "security_sdwan"))
     if backup_mode == "switching":
         return os.path.exists(os.path.join(network_folder, "switch"))
-    if backup_mode == "network_wide":
-        return os.path.exists(os.path.join(network_folder, "network_wide"))
 
     # full_enterprise: require at least one major component folder
     return any(
         os.path.exists(os.path.join(network_folder, component))
-        for component in ("wireless", "security_sdwan", "switch", "network_wide")
+        for component in ("wireless", "security_sdwan", "switch")
     )
 
 
@@ -201,6 +221,59 @@ def find_snapshot_folder_for_network_and_mode(snapshot_name: str, network_name: 
         return None, None
 
     target_normalized = normalize_network_name(network_name)
+    for folder in os.listdir(snapshot_network_root):
+        if normalize_network_name(folder) != target_normalized:
+            continue
+        candidate = os.path.join(snapshot_network_root, folder)
+        if snapshot_has_mode_data(candidate, backup_mode):
+            return candidate, snapshot_name
+
+    return None, None
+
+
+def find_mode_compatible_folders_in_snapshot(snapshot_name: str, backup_mode: str):
+    """
+    Return all network folders in a snapshot that can satisfy the requested mode.
+    """
+    if not snapshot_name:
+        return []
+
+    snapshot_network_root = os.path.join(
+        config.backup_directory,
+        snapshot_name,
+        "network"
+    )
+    if not os.path.exists(snapshot_network_root):
+        return []
+
+    matches = []
+    for folder in os.listdir(snapshot_network_root):
+        candidate = os.path.join(snapshot_network_root, folder)
+        if not os.path.isdir(candidate):
+            continue
+        if snapshot_has_mode_data(candidate, backup_mode):
+            matches.append((candidate, folder))
+
+    return matches
+
+
+def find_snapshot_folder_for_source_network_and_mode(
+    snapshot_name: str,
+    source_network_name: str,
+    backup_mode: str
+):
+    if not snapshot_name or not source_network_name:
+        return None, None
+
+    snapshot_network_root = os.path.join(
+        config.backup_directory,
+        snapshot_name,
+        "network"
+    )
+    if not os.path.exists(snapshot_network_root):
+        return None, None
+
+    target_normalized = normalize_network_name(source_network_name)
     for folder in os.listdir(snapshot_network_root):
         if normalize_network_name(folder) != target_normalized:
             continue
@@ -398,6 +471,7 @@ def run_full_backup(org_id: str, network_id: str, backup_mode: str = "full_enter
     global is_backup_running
 
     try:
+        backup_mode = normalize_backup_mode(backup_mode)
         is_backup_running = True
         add_log("Starting Backup (Snapshot Mode)")
         add_log(f"Backup Mode: {backup_mode}")
@@ -416,12 +490,10 @@ def run_full_backup(org_id: str, network_id: str, backup_mode: str = "full_enter
         org_name = target_org["name"]
         add_log(f"Target Organization: {org_name}")
 
-        snapshot_path, snapshot_name = create_snapshot_folder(org_name)
-        add_log(f"Created Snapshot: {snapshot_name}")
-
         networks = dashboard.organizations.getOrganizationNetworks(org_id)
         if network_id == "__all__":
             target_networks = networks
+            snapshot_network_label = "All Network"
             add_log(f"Backing up ALL networks in org ({len(target_networks)} total)")
         else:
             target_network = None
@@ -434,7 +506,15 @@ def run_full_backup(org_id: str, network_id: str, backup_mode: str = "full_enter
                 raise Exception("Target Network not found")
 
             target_networks = [target_network]
+            snapshot_network_label = target_network["name"]
             add_log(f"Backing up Network: {target_network['name']}")
+
+        snapshot_path, snapshot_name = create_snapshot_folder(
+            org_name,
+            snapshot_network_label,
+            backup_mode
+        )
+        add_log(f"Created Snapshot: {snapshot_name}")
 
         class DummyLogger:
             def info(self, msg):
@@ -487,13 +567,6 @@ def run_full_backup(org_id: str, network_id: str, backup_mode: str = "full_enter
                 except Exception as e:
                     add_log(f"Switch Backup Skipped ({net_name}): {str(e)}")
 
-            if backup_mode in ("network_wide", "full_enterprise"):
-                try:
-                    add_log("Backing up Network-wide Settings...")
-                    backupSyslogSettings(target_network, snapshot_path, dashboard, logger)
-                except Exception as e:
-                    add_log(f"Network-wide Backup Skipped ({net_name}): {str(e)}")
-
         # Switching mode bundles CSV exports per user workflow.
         if backup_mode == "switching":
             try:
@@ -541,11 +614,13 @@ def run_full_restore(
     org_id: str,
     network_id: str,
     backup_mode: str = "full_enterprise",
-    selected_snapshot_name: str = ""
+    selected_snapshot_name: str = "",
+    selected_source_network_name: str = ""
 ):
     global is_restore_running
 
     try:
+        backup_mode = normalize_backup_mode(backup_mode)
         is_restore_running = True
         add_log("===== RESTORE STARTED =====")
         add_log(f"Restore Mode: {backup_mode}")
@@ -553,6 +628,8 @@ def run_full_restore(
             add_log(f"Restore Snapshot Selection: {selected_snapshot_name}")
         else:
             add_log("Restore Snapshot Selection: latest matching snapshot (auto)")
+        if selected_source_network_name:
+            add_log(f"Restore Source Network Selection: {selected_source_network_name}")
         target_networks = resolve_target_networks(org_id, network_id)
         if network_id == "__all__":
             add_log(f"Restoring ALL networks in org ({len(target_networks)} total)")
@@ -568,7 +645,13 @@ def run_full_restore(
                 target_net_id = target_network["id"]
                 log_template_binding_status(target_network)
 
-                if selected_snapshot_name:
+                if selected_snapshot_name and selected_source_network_name:
+                    target_folder, selected_snapshot = find_snapshot_folder_for_source_network_and_mode(
+                        selected_snapshot_name,
+                        selected_source_network_name,
+                        backup_mode
+                    )
+                elif selected_snapshot_name:
                     target_folder, selected_snapshot = find_snapshot_folder_for_network_and_mode(
                         selected_snapshot_name,
                         target_net_name,
@@ -579,6 +662,32 @@ def run_full_restore(
                         target_net_name,
                         backup_mode
                     )
+                if (
+                    not target_folder
+                    and selected_snapshot_name
+                    and not selected_source_network_name
+                ):
+                    # Cross-network restore fallback:
+                    # allow using the snapshot when it contains exactly one compatible source network.
+                    compatible_folders = find_mode_compatible_folders_in_snapshot(
+                        selected_snapshot_name,
+                        backup_mode
+                    )
+                    if len(compatible_folders) == 1:
+                        target_folder, source_network_name = compatible_folders[0]
+                        selected_snapshot = selected_snapshot_name
+                        add_log(
+                            f"Cross-network restore enabled: source snapshot network "
+                            f"'{source_network_name}' -> target network '{target_net_name}'"
+                        )
+                    elif len(compatible_folders) > 1:
+                        add_log(
+                            f"Restore skipped (snapshot {selected_snapshot_name} has multiple "
+                            f"{backup_mode} source networks; cannot auto-pick for {target_net_name})"
+                        )
+                        skipped_count += 1
+                        continue
+
                 if not target_folder:
                     if selected_snapshot_name:
                         add_log(
@@ -608,8 +717,6 @@ def run_full_restore(
                         org_id=org_id,
                         target_network=target_network
                     )
-                elif backup_mode == "network_wide":
-                    restoreNetworkWide(target_net_id, target_folder, dashboard)
                 else:
                     fullDeepRestore(
                         target_net_id,
@@ -649,7 +756,11 @@ def index():
 
     selected_org = request.values.get("org_id")
     selected_network = request.values.get("network_id")
+    selected_backup_mode = normalize_backup_mode(request.values.get("backup_mode", "full_enterprise"))
     selected_snapshot = request.values.get("snapshot_name", "")
+    selected_source_network = request.values.get("source_network_name", "")
+    source_networks = []
+
 
     try:
         orgs = dashboard.organizations.getOrganizations()
@@ -671,14 +782,28 @@ def index():
         except Exception as e:
             add_log(f"Error loading networks: {str(e)}")
 
+    if selected_snapshot:
+        source_networks = [
+            folder_name
+            for _, folder_name in find_mode_compatible_folders_in_snapshot(
+                selected_snapshot,
+                selected_backup_mode
+            )
+        ]
+        if selected_source_network and selected_source_network not in source_networks:
+            selected_source_network = ""
+
     return render_template(
         "index.html",
         orgs=orgs,
         networks=networks,
         selected_org=selected_org,
         selected_network=selected_network,
+        selected_backup_mode=selected_backup_mode,
         selected_snapshot=selected_snapshot,
+        selected_source_network=selected_source_network,
         snapshots=snapshots,
+        source_networks=source_networks,
         logs=operation_logs,
         is_backup_running=is_backup_running,
         is_restore_running=is_restore_running
@@ -692,8 +817,9 @@ def execute_action():
     org_id = request.form.get("org_id")
     network_id = request.form.get("network_id")
     action = request.form.get("action")
-    backup_mode = request.form.get("backup_mode", "full_enterprise")
+    backup_mode = normalize_backup_mode(request.form.get("backup_mode", "full_enterprise"))
     snapshot_name = (request.form.get("snapshot_name") or "").strip()
+    source_network_name = (request.form.get("source_network_name") or "").strip()
 
     if not org_id or not network_id:
         flash("กรุณาเลือก Organization และ Network ก่อน", "danger")
@@ -737,7 +863,7 @@ def execute_action():
 
         thread = threading.Thread(
             target=run_full_restore,
-            args=(org_id, network_id, backup_mode, snapshot_name)
+            args=(org_id, network_id, backup_mode, snapshot_name, source_network_name)
         )
         thread.daemon = True
         thread.start()
@@ -752,7 +878,9 @@ def execute_action():
             "index",
             org_id=org_id,
             network_id=network_id,
-            snapshot_name=snapshot_name
+            backup_mode=backup_mode,
+            snapshot_name=snapshot_name,
+            source_network_name=source_network_name
         )
     )
 

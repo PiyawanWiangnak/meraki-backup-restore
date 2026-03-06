@@ -86,6 +86,11 @@ select {
 
 .btn-backup:hover { background: #1a5fd1; }
 .btn-restore:hover { background: #c0392b; }
+.btn-backup:disabled,
+.btn-restore:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
 
 .btn-export-clients {
     flex: 1;
@@ -184,6 +189,25 @@ select {
     animation: spin 0.8s linear infinite;
 }
 
+.loading-actions {
+    display: none;
+    margin-top: 14px;
+}
+
+.btn-acknowledge {
+    background: #2563eb;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 18px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.btn-acknowledge:hover {
+    background: #1d4ed8;
+}
+
 @keyframes spin {
     to { transform: rotate(360deg); }
 }
@@ -235,16 +259,15 @@ Meraki Enterprise Backup & Restore (Snapshot-Based)
 
         <!-- STEP 3 -->
         <div class="step" style="margin-top:20px;">Step 3: Backup / Restore Options</div>
-        <select name="backup_mode" required>
-            <option value="wireless">Wireless Backup (SSID + Security + RF)</option>
-            <option value="security_sdwan">Security &amp; SD-WAN Backup (MX Configure + Firmware + Monitor Snapshot)</option>
-            <option value="switching">Switching Backup (Full + Clients/Usage CSV + SM Inventory CSV)</option>
-            <option value="network_wide">Network-wide Backup (Full Configure + Monitor Snapshot)</option>
-            <option value="full_enterprise" selected>Full Enterprise Backup (MR + MX + MS + Network-wide)</option>
+        <select id="backup_mode" name="backup_mode" required>
+            <option value="wireless" {% if selected_backup_mode == "wireless" %}selected{% endif %}>Wireless Backup (SSID + Security + RF)</option>
+            <option value="security_sdwan" {% if selected_backup_mode == "security_sdwan" %}selected{% endif %}>Security &amp; SD-WAN Backup (MX Configure + Firmware + Monitor Snapshot)</option>
+            <option value="switching" {% if selected_backup_mode == "switching" %}selected{% endif %}>Switching Backup (Full + Clients/Usage CSV + SM Inventory CSV)</option>
+            <option value="full_enterprise" {% if selected_backup_mode == "full_enterprise" %}selected{% endif %}>Full Enterprise Backup (MR + MX + MS)</option>
         </select>
 
         <!-- STEP 4 -->
-        <div class="step" style="margin-top:20px;">Step 4: Please Select File For Restore</div>
+        <div class="step" style="margin-top:20px;">Step 4: Select Snapshot For Restore</div>
         <select id="snapshot_name" name="snapshot_name">
             <option value="" {% if not selected_snapshot %}selected{% endif %}>
                 Please select file (Latest auto)
@@ -255,7 +278,6 @@ Meraki Enterprise Backup & Restore (Snapshot-Based)
             </option>
             {% endfor %}
         </select>
-
         <!-- ACTION BUTTONS -->
         <div class="button-row">
             <button type="submit" name="action" value="backup" class="btn-backup">
@@ -284,8 +306,11 @@ Meraki Enterprise Backup & Restore (Snapshot-Based)
 
 <div id="loadingOverlay" class="loading-overlay">
     <div class="loading-box">
-        <div class="loading-spinner"></div>
+        <div id="loadingSpinner" class="loading-spinner"></div>
         <div id="loadingMessage">Processing...</div>
+        <div id="loadingActions" class="loading-actions">
+            <button id="acknowledgeBtn" type="button" class="btn-acknowledge">OK</button>
+        </div>
     </div>
 </div>
 
@@ -298,48 +323,119 @@ document.addEventListener("DOMContentLoaded", function () {
 
     const orgSelect = document.getElementById("org_id");
     const networkSelect = document.querySelector('select[name="network_id"]');
+    const backupModeSelect = document.getElementById("backup_mode");
     const snapshotSelect = document.getElementById("snapshot_name");
     const form = document.querySelector('form[action="/execute_action"]');
     const loadingOverlay = document.getElementById("loadingOverlay");
+    const loadingSpinner = document.getElementById("loadingSpinner");
     const loadingMessage = document.getElementById("loadingMessage");
+    const loadingActions = document.getElementById("loadingActions");
+    const acknowledgeBtn = document.getElementById("acknowledgeBtn");
     const statusToast = document.getElementById("statusToast");
     const logsBox = document.querySelector(".logs");
+    const actionButtons = form ? form.querySelectorAll('button[type="submit"][name="action"]') : [];
     const actionLabels = {
         backup: "Backup",
         restore: "Restore"
     };
+    const isAnyOperationRunning = appState.isBackupRunning || appState.isRestoreRunning;
+
+    function setActionsLocked(locked) {
+        if (!form) return;
+        actionButtons.forEach(function (button) {
+            button.disabled = locked;
+        });
+    }
+
+    function showRunningOverlay(message) {
+        if (loadingOverlay && loadingMessage && loadingSpinner && loadingActions) {
+            loadingMessage.textContent = message;
+            loadingMessage.style.color = "#111827";
+            loadingSpinner.style.display = "block";
+            loadingActions.style.display = "none";
+            loadingOverlay.style.display = "flex";
+        }
+    }
+
+    function showResultOverlay(message, isError) {
+        if (loadingOverlay && loadingMessage && loadingSpinner && loadingActions) {
+            loadingMessage.textContent = message;
+            loadingMessage.style.color = isError ? "#a52b2b" : "#1f7a3f";
+            loadingSpinner.style.display = "none";
+            loadingActions.style.display = "block";
+            loadingOverlay.style.display = "flex";
+        }
+    }
+
+    function buildIndexUrl() {
+        const orgId = orgSelect ? encodeURIComponent(orgSelect.value) : "";
+        const networkId = networkSelect ? encodeURIComponent(networkSelect.value) : "";
+        const backupMode = backupModeSelect ? encodeURIComponent(backupModeSelect.value) : "";
+        const snapshotName = snapshotSelect ? encodeURIComponent(snapshotSelect.value) : "";
+        let url = "/?org_id=" + orgId;
+        if (networkId) {
+            url += "&network_id=" + networkId;
+        }
+        if (backupMode) {
+            url += "&backup_mode=" + backupMode;
+        }
+        if (snapshotName) {
+            url += "&snapshot_name=" + snapshotName;
+        }
+        return url;
+    }
 
     if (orgSelect) {
         orgSelect.addEventListener("change", function () {
-            const orgId = encodeURIComponent(orgSelect.value);
-            const networkId = networkSelect ? encodeURIComponent(networkSelect.value) : "";
-            const snapshotName = snapshotSelect ? encodeURIComponent(snapshotSelect.value) : "";
-            let url = "/?org_id=" + orgId;
-            if (networkId) {
-                url += "&network_id=" + networkId;
-            }
-            if (snapshotName) {
-                url += "&snapshot_name=" + snapshotName;
-            }
-            window.location.href = url;
+            window.location.href = buildIndexUrl();
+        });
+    }
+
+    if (networkSelect) {
+        networkSelect.addEventListener("change", function () {
+            window.location.href = buildIndexUrl();
+        });
+    }
+
+    if (backupModeSelect) {
+        backupModeSelect.addEventListener("change", function () {
+            window.location.href = buildIndexUrl();
+        });
+    }
+
+    if (snapshotSelect) {
+        snapshotSelect.addEventListener("change", function () {
+            window.location.href = buildIndexUrl();
         });
     }
 
     if (form) {
         form.addEventListener("submit", function (event) {
+            if (isAnyOperationRunning) {
+                event.preventDefault();
+                showRunningOverlay("Another operation is already running. Please wait.");
+                return;
+            }
+
             const action = event.submitter ? event.submitter.value : "operation";
             sessionStorage.setItem("pendingAction", action);
 
-            if (loadingOverlay && loadingMessage) {
-                const label = actionLabels[action] || "Operation";
-                loadingMessage.textContent = "Running " + label + "... Please wait.";
-                loadingOverlay.style.display = "flex";
-            }
+            const label = actionLabels[action] || "Operation";
+            showRunningOverlay("Running " + label + "... Please wait.");
         });
     }
 
+    if (isAnyOperationRunning) {
+        const runningLabel = appState.isBackupRunning ? "Backup" : "Restore";
+        setActionsLocked(true);
+        showRunningOverlay(runningLabel + " is running... Please wait.");
+        setTimeout(function () {
+            window.location.reload();
+        }, 3000);
+    }
+
     const pendingAction = sessionStorage.getItem("pendingAction");
-    if (pendingAction && statusToast) {
+    if (pendingAction) {
         const logText = logsBox ? logsBox.textContent.toLowerCase() : "";
         const failed =
             logText.includes("error") ||
@@ -351,20 +447,23 @@ document.addEventListener("DOMContentLoaded", function () {
             (pendingAction === "backup" && appState.isBackupRunning) ||
             (pendingAction === "restore" && appState.isRestoreRunning);
 
-        if (stillRunning) {
-            statusToast.classList.add("info");
-            statusToast.textContent = label + " is still running. Please wait...";
-            setTimeout(function () {
-                window.location.reload();
-            }, 3000);
-        } else {
-            statusToast.classList.add(failed ? "error" : "success");
-            statusToast.textContent = failed
-                ? label + " failed. Please check logs below."
-                : label + " completed successfully.";
-
-            sessionStorage.removeItem("pendingAction");
+        if (!stillRunning) {
+            showResultOverlay(
+                failed
+                    ? label + " failed. Please check logs below."
+                    : label + " completed successfully.",
+                failed
+            );
         }
+    }
+
+    if (acknowledgeBtn) {
+        acknowledgeBtn.addEventListener("click", function () {
+            sessionStorage.removeItem("pendingAction");
+            if (loadingOverlay) {
+                loadingOverlay.style.display = "none";
+            }
+        });
     }
 });
 </script>

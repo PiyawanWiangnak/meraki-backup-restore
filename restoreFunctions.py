@@ -153,6 +153,95 @@ def _is_valid_http_url(value):
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def _network_has_appliance(dashboard, network_id):
+    try:
+        devices = dashboard.networks.getNetworkDevices(network_id)
+    except Exception:
+        devices = []
+    for device in devices:
+        model = str(device.get("model", "")).upper()
+        product_type = str(device.get("productType", "")).lower()
+        if model.startswith("MX") or product_type == "appliance":
+            return True
+    # Fallback: some networks expose appliance product type even when no MX serial
+    # appears in getNetworkDevices yet.
+    try:
+        network_detail = dashboard.networks.getNetwork(network_id)
+        product_types = _ensure_list(network_detail.get("productTypes"))
+        normalized = {str(p).lower() for p in product_types}
+        if "appliance" in normalized:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _collect_snapshot_lan_subnets(security_root):
+    subnets = []
+
+    single_lan = _load_json_if_exists(os.path.join(security_root, "single_lan.json"))
+    if isinstance(single_lan, dict):
+        subnet = single_lan.get("subnet")
+        if isinstance(subnet, str) and subnet.strip():
+            subnets.append(subnet.strip())
+
+    vlans = _ensure_list(_load_json_if_exists(os.path.join(security_root, "vlans.json")))
+    for vlan in vlans:
+        if not isinstance(vlan, dict):
+            continue
+        subnet = vlan.get("subnet")
+        if isinstance(subnet, str) and subnet.strip():
+            subnets.append(subnet.strip())
+
+    return subnets
+
+
+def _collect_target_lan_subnets(network_id, dashboard):
+    subnets = []
+
+    try:
+        single_lan = dashboard.appliance.getNetworkApplianceSingleLan(network_id)
+        if isinstance(single_lan, dict):
+            subnet = single_lan.get("subnet")
+            if isinstance(subnet, str) and subnet.strip():
+                subnets.append(subnet.strip())
+    except Exception:
+        pass
+
+    try:
+        vlans = _ensure_list(dashboard.appliance.getNetworkApplianceVlans(network_id))
+        for vlan in vlans:
+            if not isinstance(vlan, dict):
+                continue
+            subnet = vlan.get("subnet")
+            if isinstance(subnet, str) and subnet.strip():
+                subnets.append(subnet.strip())
+    except Exception:
+        pass
+
+    return subnets
+
+
+def _ip_is_in_any_subnet(ip_text, subnets):
+    if not isinstance(ip_text, str):
+        return False
+    token = ip_text.strip()
+    if not token:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(token)
+    except ValueError:
+        return False
+
+    for subnet in subnets:
+        try:
+            if ip_obj in ipaddress.ip_network(subnet, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _sanitize_ssid_l3_firewall_payload(payload, ssid_number):
     if not isinstance(payload, dict):
         return {}
@@ -217,6 +306,179 @@ def _sanitize_splash_payload(payload):
         if isinstance(blob, dict) and blob.get("md5") is None:
             cleaned.pop(key, None)
 
+    guest_sponsorship = cleaned.get("guestSponsorship")
+    if isinstance(guest_sponsorship, dict):
+        duration = guest_sponsorship.get("durationInMinutes")
+        if duration is None:
+            guest_sponsorship.pop("durationInMinutes", None)
+        elif not isinstance(duration, int):
+            try:
+                guest_sponsorship["durationInMinutes"] = int(duration)
+            except Exception:
+                guest_sponsorship.pop("durationInMinutes", None)
+        cleaned["guestSponsorship"] = guest_sponsorship
+
+    # Some orgs reject null/structured welcomeMessage; keep only plain string.
+    welcome_message = cleaned.get("welcomeMessage")
+    if welcome_message is None:
+        cleaned.pop("welcomeMessage", None)
+    elif not isinstance(welcome_message, str):
+        cleaned["welcomeMessage"] = str(welcome_message)
+
+    theme_id = cleaned.get("themeId")
+    if theme_id is None:
+        cleaned.pop("themeId", None)
+    elif not isinstance(theme_id, str):
+        cleaned.pop("themeId", None)
+
+    billing = cleaned.get("billing")
+    if isinstance(billing, dict):
+        prepaid_fast_login = billing.get("prepaidAccessFastLoginEnabled")
+        if prepaid_fast_login is None:
+            billing["prepaidAccessFastLoginEnabled"] = False
+        elif not isinstance(prepaid_fast_login, bool):
+            billing["prepaidAccessFastLoginEnabled"] = bool(prepaid_fast_login)
+        cleaned["billing"] = billing
+
+    return cleaned
+
+
+def _sanitize_ssid_hotspot20_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+
+    valid_network_access_types = {
+        "Chargeable public network",
+        "Emergency services only network",
+        "Free public network",
+        "Personal device network",
+        "Private network",
+        "Private network with guest access",
+        "Test or experimental",
+        "Wildcard",
+    }
+
+    cleaned = dict(payload)
+    enabled = bool(cleaned.get("enabled", False))
+    cleaned["enabled"] = enabled
+
+    network_access_type = cleaned.get("networkAccessType")
+    if isinstance(network_access_type, str):
+        network_access_type = network_access_type.strip()
+    if network_access_type not in valid_network_access_types:
+        cleaned.pop("networkAccessType", None)
+
+    operator = cleaned.get("operator")
+    if isinstance(operator, dict):
+        if operator.get("name") is None:
+            operator.pop("name", None)
+        if operator:
+            cleaned["operator"] = operator
+        else:
+            cleaned.pop("operator", None)
+
+    venue = cleaned.get("venue")
+    if isinstance(venue, dict):
+        if venue.get("name") is None:
+            venue.pop("name", None)
+        if venue.get("type") is None:
+            venue.pop("type", None)
+        if venue:
+            cleaned["venue"] = venue
+        else:
+            cleaned.pop("venue", None)
+
+    return cleaned
+
+
+def _sanitize_ssid_vpn_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    cleaned = dict(payload)
+
+    request_ip = cleaned.get("requestIp")
+    if request_ip is None:
+        cleaned.pop("requestIp", None)
+    elif not isinstance(request_ip, str):
+        cleaned.pop("requestIp", None)
+
+    failover = cleaned.get("failover")
+    if isinstance(failover, dict):
+        failover_request_ip = failover.get("requestIp")
+        if failover_request_ip is None or not isinstance(failover_request_ip, str):
+            failover.pop("requestIp", None)
+        cleaned["failover"] = failover
+
+    concentrator = cleaned.get("concentrator")
+    if isinstance(concentrator, dict) and not concentrator:
+        cleaned.pop("concentrator", None)
+
+    return cleaned
+
+
+def _build_ssid_base_fallback_payload(payload):
+    if not isinstance(payload, dict):
+        return payload, False
+
+    fallback = dict(payload)
+    changed = False
+
+    wpa_mode = fallback.get("wpaEncryptionMode")
+    if isinstance(wpa_mode, str) and "WPA3" in wpa_mode.upper():
+        fallback["wpaEncryptionMode"] = "WPA2 only"
+        changed = True
+
+    if str(fallback.get("authMode", "")).lower() == "open":
+        if "wpaEncryptionMode" in fallback:
+            fallback.pop("wpaEncryptionMode", None)
+            changed = True
+
+    return fallback, changed
+
+
+def _dedupe_switch_acl_rules(rules):
+    deduped = []
+    seen = set()
+    for rule in _ensure_list(rules):
+        if not isinstance(rule, dict):
+            continue
+        key = (
+            str(rule.get("comment", "")).strip().lower(),
+            str(rule.get("policy", "")).strip().lower(),
+            str(rule.get("ipVersion", "")).strip().lower(),
+            str(rule.get("protocol", "")).strip().lower(),
+            str(rule.get("srcCidr", "")).strip().lower(),
+            str(rule.get("srcPort", "")).strip().lower(),
+            str(rule.get("dstCidr", "")).strip().lower(),
+            str(rule.get("dstPort", "")).strip().lower(),
+            str(rule.get("vlan", "")).strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rule)
+    return deduped
+
+
+def _sanitize_switch_stp_payload(stp_payload, valid_serials):
+    if not isinstance(stp_payload, dict):
+        return {}
+    cleaned = dict(stp_payload)
+    priorities = _ensure_list(cleaned.get("stpBridgePriority"))
+    filtered_priorities = []
+    for item in priorities:
+        if not isinstance(item, dict):
+            continue
+        switches = [s for s in _ensure_list(item.get("switches")) if isinstance(s, str) and s in valid_serials]
+        if not switches:
+            continue
+        item_clean = dict(item)
+        item_clean["switches"] = switches
+        filtered_priorities.append(item_clean)
+    if filtered_priorities:
+        cleaned["stpBridgePriority"] = filtered_priorities
+    else:
+        cleaned.pop("stpBridgePriority", None)
     return cleaned
 
 
@@ -318,7 +580,25 @@ def restoreWirelessComplete(network_id, network_folder, dashboard):
             dashboard.wireless.updateNetworkWirelessSsid(network_id, number, **ssid_payload)
             print(f"[RESTORE] SSID {number} base settings restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] SSID {number} base settings: {e}")
+            fallback_payload, can_retry = _build_ssid_base_fallback_payload(ssid_payload)
+            if can_retry:
+                try:
+                    dashboard.wireless.updateNetworkWirelessSsid(
+                        network_id,
+                        number,
+                        **fallback_payload
+                    )
+                    print(
+                        f"[RESTORE WARN] SSID {number} base settings restored with fallback "
+                        f"(downgraded unsupported WPA3 mode to WPA2 only)"
+                    )
+                except Exception as retry_error:
+                    print(
+                        f"[RESTORE ERROR] SSID {number} base settings: {e} "
+                        f"(retry failed: {retry_error})"
+                    )
+            else:
+                print(f"[RESTORE ERROR] SSID {number} base settings: {e}")
 
         ssid_path = os.path.join(ssid_root, str(number))
         if not os.path.exists(ssid_path):
@@ -341,12 +621,7 @@ def restoreWirelessComplete(network_id, network_folder, dashboard):
                 continue
             try:
                 if file_name == "vpn.json" and isinstance(payload, dict):
-                    vpn_payload = dict(payload)
-                    request_ip = vpn_payload.get("requestIp")
-                    if request_ip is None:
-                        vpn_payload.pop("requestIp", None)
-                    elif not isinstance(request_ip, str):
-                        vpn_payload["requestIp"] = str(request_ip)
+                    vpn_payload = _sanitize_ssid_vpn_payload(payload)
                     api_call(network_id, number, **vpn_payload)
                     print(f"[RESTORE] SSID {number} {file_name} restored")
                     continue
@@ -360,10 +635,21 @@ def restoreWirelessComplete(network_id, network_folder, dashboard):
                     api_call(network_id, number, **splash_payload)
                     print(f"[RESTORE] SSID {number} {file_name} restored")
                     continue
+                if file_name == "hotspot20.json":
+                    hotspot20_payload = _sanitize_ssid_hotspot20_payload(payload)
+                    api_call(network_id, number, **hotspot20_payload)
+                    print(f"[RESTORE] SSID {number} {file_name} restored")
+                    continue
                 api_call(network_id, number, **payload)
                 print(f"[RESTORE] SSID {number} {file_name} restored")
             except Exception as e:
-                print(f"[RESTORE ERROR] SSID {number} {file_name}: {e}")
+                if file_name == "vpn.json":
+                    print(
+                        f"[RESTORE SKIP] SSID {number} {file_name}: {e} "
+                        f"(VPN target network reference may not exist in destination org)"
+                    )
+                else:
+                    print(f"[RESTORE ERROR] SSID {number} {file_name}: {e}")
 
         identity_psks = _ensure_list(_load_json_if_exists(os.path.join(ssid_path, "identity_psks.json")))
         for psk in identity_psks:
@@ -435,10 +721,17 @@ def restoreSwitch(network_id, network_folder, dashboard, org_id=None, target_net
     acl = _load_json_if_exists(os.path.join(switch_root, "acl.json"))
     if acl and isinstance(acl, dict):
         try:
+            acl_rules = _dedupe_switch_acl_rules(acl.get("rules", []))
             dashboard.switch.updateNetworkSwitchAccessControlLists(
                 network_id,
-                rules=acl.get("rules", [])
+                rules=acl_rules
             )
+            original_count = len(_ensure_list(acl.get("rules", [])))
+            if len(acl_rules) < original_count:
+                print(
+                    f"[RESTORE WARN] Switch ACL deduplicated: removed {original_count - len(acl_rules)} "
+                    "duplicate rule(s)"
+                )
             print("[RESTORE] Switch ACL restored")
         except Exception as e:
             print(f"[RESTORE ERROR] Switch ACL: {e}")
@@ -571,11 +864,24 @@ def restoreSwitch(network_id, network_folder, dashboard, org_id=None, target_net
             v3_enabled = bool(v3.get("enabled", False))
             if ospf_enabled and not areas:
                 print("[RESTORE SKIP] Switch OSPF skipped: enabled but no areas")
-            elif v3_enabled and not v3_areas:
-                print("[RESTORE SKIP] Switch OSPF v3 skipped: enabled but no v3 areas")
             else:
-                dashboard.switch.updateNetworkSwitchRoutingOspf(network_id, **ospf_payload)
-                print("[RESTORE] Switch OSPF restored")
+                if not ospf_enabled:
+                    ospf_payload.pop("areas", None)
+                if v3_enabled and not v3_areas:
+                    print("[RESTORE WARN] Switch OSPF v3 disabled during restore: no v3 areas in snapshot")
+                    v3_enabled = False
+                if v3_enabled:
+                    ospf_payload["v3"] = v3
+                else:
+                    ospf_payload.pop("v3", None)
+                if not ospf_enabled and not v3_enabled:
+                    print("[RESTORE SKIP] Switch OSPF skipped: both OSPF and OSPFv3 disabled")
+                    ospf_payload = None
+                if not ospf_payload:
+                    pass
+                else:
+                    dashboard.switch.updateNetworkSwitchRoutingOspf(network_id, **ospf_payload)
+                    print("[RESTORE] Switch OSPF restored")
         except Exception as e:
             print(f"[RESTORE ERROR] Switch OSPF: {e}")
 
@@ -591,7 +897,26 @@ def restoreSwitch(network_id, network_folder, dashboard, org_id=None, target_net
     stp = _load_json_if_exists(os.path.join(switch_root, "stp.json"))
     if stp:
         try:
-            dashboard.switch.updateNetworkSwitchStp(network_id, **stp)
+            valid_serials = set()
+            try:
+                current_devices = dashboard.networks.getNetworkDevices(network_id)
+                valid_serials = {
+                    d.get("serial")
+                    for d in _ensure_list(current_devices)
+                    if isinstance(d, dict) and d.get("serial")
+                }
+            except Exception:
+                pass
+            stp_payload = _sanitize_switch_stp_payload(stp, valid_serials)
+            dashboard.switch.updateNetworkSwitchStp(network_id, **stp_payload)
+            if isinstance(stp, dict) and isinstance(stp_payload, dict):
+                original = len(_ensure_list(stp.get("stpBridgePriority")))
+                final = len(_ensure_list(stp_payload.get("stpBridgePriority")))
+                if final < original:
+                    print(
+                        f"[RESTORE WARN] Switch STP filtered out {original - final} "
+                        "bridge-priority entry(ies) for missing switches"
+                    )
             print("[RESTORE] Switch STP restored")
         except Exception as e:
             print(f"[RESTORE ERROR] Switch STP: {e}")
@@ -857,6 +1182,8 @@ def restoreNetworkWide(network_id, network_folder, dashboard):
     if network_info:
         try:
             network_info_payload = dict(network_info) if isinstance(network_info, dict) else {}
+            # Never rename target network during restore.
+            network_info_payload.pop("name", None)
             if not isinstance(network_info_payload.get("enrollmentString"), str):
                 network_info_payload.pop("enrollmentString", None)
             dashboard.networks.updateNetwork(network_id, **network_info_payload)
@@ -949,6 +1276,32 @@ def restoreNetworkWide(network_id, network_folder, dashboard):
                 dashboard.networks.createNetworkGroupPolicy(network_id, name=name, **create_payload)
             print(f"[RESTORE] Group policy restored: {name}")
         except Exception as e:
+            message = str(e)
+            if "Content Filtering settings are not supported" in message:
+                try:
+                    fallback_policy = dict(policy)
+                    fallback_policy.pop("contentFiltering", None)
+                    if existing and existing.get("groupPolicyId"):
+                        dashboard.networks.updateNetworkGroupPolicy(
+                            network_id,
+                            existing.get("groupPolicyId"),
+                            **fallback_policy
+                        )
+                    else:
+                        fallback_create = dict(fallback_policy)
+                        fallback_create.pop("name", None)
+                        dashboard.networks.createNetworkGroupPolicy(
+                            network_id,
+                            name=name,
+                            **fallback_create
+                        )
+                    print(
+                        f"[RESTORE WARN] Group policy restored without contentFiltering (unsupported): {name}"
+                    )
+                    continue
+                except Exception as retry_e:
+                    print(f"[RESTORE ERROR] Group policy {name}: {e} (retry failed: {retry_e})")
+                    continue
             print(f"[RESTORE ERROR] Group policy {name}: {e}")
 
     # Configure > Users (Meraki Auth)
@@ -1064,6 +1417,16 @@ def restoreNetworkWide(network_id, network_folder, dashboard):
 
     assignments = _ensure_list(_load_json_if_exists(os.path.join(nw_folder, "vlan_profile_assignments_by_device.json")))
     if assignments:
+        current_serials = set()
+        try:
+            current_devices = dashboard.networks.getNetworkDevices(network_id)
+            current_serials = {
+                d.get("serial")
+                for d in _ensure_list(current_devices)
+                if isinstance(d, dict) and d.get("serial")
+            }
+        except Exception:
+            pass
         grouped = {}
         for item in assignments:
             if not isinstance(item, dict):
@@ -1083,6 +1446,10 @@ def restoreNetworkWide(network_id, network_folder, dashboard):
                 grouped[key]["stackIds"].append(stack_id)
 
         for payload in grouped.values():
+            payload["serials"] = sorted(set(payload["serials"]))
+            payload["stackIds"] = sorted(set(payload["stackIds"]))
+            if current_serials:
+                payload["serials"] = [s for s in payload["serials"] if s in current_serials]
             if not payload["serials"] and not payload["stackIds"]:
                 continue
             try:
@@ -1191,6 +1558,10 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
         print("[RESTORE SKIP] No security_sdwan folder")
         return
 
+    if not _network_has_appliance(dashboard, network_id):
+        print("[RESTORE SKIP] Security/SD-WAN skipped: target network has no MX appliance")
+        return
+
     # Addressing & VLANs / DHCP
     firmware = _load_json_if_exists(os.path.join(security_root, "firmware_upgrades.json"))
     if firmware:
@@ -1208,21 +1579,46 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
         except Exception as e:
             print(f"[RESTORE ERROR] Appliance settings: {e}")
 
-    single_lan = _load_json_if_exists(os.path.join(security_root, "single_lan.json"))
-    if single_lan:
-        try:
-            dashboard.appliance.updateNetworkApplianceSingleLan(network_id, **single_lan)
-            print("[RESTORE] Single LAN restored")
-        except Exception as e:
-            print(f"[RESTORE ERROR] Single LAN: {e}")
-
     vlans_settings = _load_json_if_exists(os.path.join(security_root, "vlans_settings.json"))
+    target_vlans_enabled = None
+    try:
+        current_vlans_settings = dashboard.appliance.getNetworkApplianceVlansSettings(network_id)
+        if isinstance(current_vlans_settings, dict):
+            target_vlans_enabled = current_vlans_settings.get("vlansEnabled")
+    except Exception:
+        pass
+
     if vlans_settings:
         try:
             dashboard.appliance.updateNetworkApplianceVlansSettings(network_id, **vlans_settings)
             print("[RESTORE] VLAN settings restored")
+            if isinstance(vlans_settings, dict):
+                target_vlans_enabled = vlans_settings.get("vlansEnabled", target_vlans_enabled)
         except Exception as e:
-            print(f"[RESTORE ERROR] VLAN settings: {e}")
+            error_text = str(e)
+            if "Invalid port forwarding rule" in error_text:
+                try:
+                    dashboard.appliance.updateNetworkApplianceFirewallPortForwardingRules(network_id, rules=[])
+                    print("[RESTORE WARN] Port forwarding rules temporarily cleared for VLAN settings update")
+                    dashboard.appliance.updateNetworkApplianceVlansSettings(network_id, **vlans_settings)
+                    print("[RESTORE] VLAN settings restored (after clearing existing port forwarding rules)")
+                    if isinstance(vlans_settings, dict):
+                        target_vlans_enabled = vlans_settings.get("vlansEnabled", target_vlans_enabled)
+                except Exception as retry_e:
+                    print(f"[RESTORE ERROR] VLAN settings: {e} (retry failed: {retry_e})")
+            else:
+                print(f"[RESTORE ERROR] VLAN settings: {e}")
+
+    single_lan = _load_json_if_exists(os.path.join(security_root, "single_lan.json"))
+    if single_lan:
+        if target_vlans_enabled is True:
+            print("[RESTORE SKIP] Single LAN skipped: destination network currently has VLANs enabled")
+        else:
+            try:
+                dashboard.appliance.updateNetworkApplianceSingleLan(network_id, **single_lan)
+                print("[RESTORE] Single LAN restored")
+            except Exception as e:
+                print(f"[RESTORE ERROR] Single LAN: {e}")
 
     vlans = _load_json_if_exists(os.path.join(security_root, "vlans.json")) or []
     existing_vlans = []
@@ -1237,12 +1633,12 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
         if vlan_id is None:
             continue
         try:
+            # Avoid duplicated API args (e.g. networkId/id/name) when using positional params.
+            vlan_payload = _drop_keys(vlan, "networkId", "id", "name")
             if str(vlan_id) in existing_vlan_ids:
-                dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **vlan)
+                dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **vlan_payload)
             else:
-                create_vlan_payload = dict(vlan)
-                create_vlan_payload.pop("id", None)
-                create_vlan_payload.pop("name", None)
+                create_vlan_payload = dict(vlan_payload)
                 dashboard.appliance.createNetworkApplianceVlan(
                     network_id,
                     id=vlan_id,
@@ -1254,7 +1650,16 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             print(f"[RESTORE ERROR] VLAN {vlan_id}: {e}")
 
     ports = _load_json_if_exists(os.path.join(security_root, "ports.json")) or []
+    appliance_ports_supported = True
+    if ports:
+        try:
+            dashboard.appliance.getNetworkAppliancePorts(network_id)
+        except Exception as e:
+            appliance_ports_supported = False
+            print(f"[RESTORE SKIP] MX ports skipped: {e}")
     for port in ports:
+        if not appliance_ports_supported:
+            break
         port_id = port.get("number") or port.get("portId")
         if port_id is None:
             continue
@@ -1267,7 +1672,14 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
     fw_l3 = _load_json_if_exists(os.path.join(security_root, "firewall_l3.json"))
     if fw_l3:
         try:
-            dashboard.appliance.updateNetworkApplianceFirewallL3FirewallRules(network_id, **fw_l3)
+            fw_l3_payload = dict(fw_l3) if isinstance(fw_l3, dict) else {}
+            rules = _ensure_list(fw_l3_payload.get("rules"))
+            for rule in rules:
+                if isinstance(rule, dict) and "syslogEnabled" in rule:
+                    # Avoid hard fail when syslog server is missing on target.
+                    rule["syslogEnabled"] = False
+            fw_l3_payload["rules"] = rules
+            dashboard.appliance.updateNetworkApplianceFirewallL3FirewallRules(network_id, **fw_l3_payload)
             print("[RESTORE] Firewall L3 restored")
         except Exception as e:
             print(f"[RESTORE ERROR] Firewall L3: {e}")
@@ -1305,7 +1717,11 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
     inbound_fw = _load_json_if_exists(os.path.join(security_root, "firewall_inbound.json"))
     if inbound_fw:
         try:
-            dashboard.appliance.updateNetworkApplianceFirewallInboundFirewallRules(network_id, **inbound_fw)
+            inbound_payload = dict(inbound_fw) if isinstance(inbound_fw, dict) else {}
+            syslog_default_rule = inbound_payload.get("syslogDefaultRule")
+            if not isinstance(syslog_default_rule, bool):
+                inbound_payload.pop("syslogDefaultRule", None)
+            dashboard.appliance.updateNetworkApplianceFirewallInboundFirewallRules(network_id, **inbound_payload)
             print("[RESTORE] Inbound firewall restored")
         except Exception as e:
             print(f"[RESTORE ERROR] Inbound firewall: {e}")
@@ -1313,9 +1729,23 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
     pfw = _load_json_if_exists(os.path.join(security_root, "firewall_port_forwarding.json"))
     if pfw and isinstance(pfw, dict):
         try:
+            lan_subnets = _collect_target_lan_subnets(network_id, dashboard)
+            if not lan_subnets:
+                lan_subnets = _collect_snapshot_lan_subnets(security_root)
+            filtered_rules = []
+            for rule in _ensure_list(pfw.get("rules")):
+                if not isinstance(rule, dict):
+                    continue
+                lan_ip = rule.get("lanIp")
+                if lan_subnets and isinstance(lan_ip, str) and not _ip_is_in_any_subnet(lan_ip, lan_subnets):
+                    print(
+                        f"[RESTORE SKIP] Port forwarding rule skipped (lanIp {lan_ip} not in snapshot LAN subnets)"
+                    )
+                    continue
+                filtered_rules.append(rule)
             dashboard.appliance.updateNetworkApplianceFirewallPortForwardingRules(
                 network_id,
-                rules=pfw.get("rules", [])
+                rules=filtered_rules
             )
             print("[RESTORE] Port forwarding restored")
         except Exception as e:
@@ -1433,7 +1863,23 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkBandwidth(network_id, **uplink_bw)
             print("[RESTORE] Uplink bandwidth restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] Uplink bandwidth: {e}")
+            err = str(e).lower()
+            if "wan2" in err:
+                try:
+                    uplink_bw_payload = dict(uplink_bw) if isinstance(uplink_bw, dict) else {}
+                    limits = uplink_bw_payload.get("bandwidthLimits")
+                    if isinstance(limits, dict):
+                        limits.pop("wan2", None)
+                        uplink_bw_payload["bandwidthLimits"] = limits
+                    dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkBandwidth(
+                        network_id,
+                        **uplink_bw_payload
+                    )
+                    print("[RESTORE] Uplink bandwidth restored (wan1-only fallback)")
+                except Exception as e2:
+                    print(f"[RESTORE ERROR] Uplink bandwidth fallback: {e2}")
+            else:
+                print(f"[RESTORE ERROR] Uplink bandwidth: {e}")
 
     uplink_sel = _load_json_if_exists(os.path.join(security_root, "traffic_shaping_uplink_selection.json"))
     if uplink_sel:
@@ -1441,7 +1887,11 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             dashboard.appliance.updateNetworkApplianceTrafficShapingUplinkSelection(network_id, **uplink_sel)
             print("[RESTORE] Uplink selection restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] Uplink selection: {e}")
+            err = str(e).lower()
+            if "unsupported for networks without a failover capable mx" in err:
+                print(f"[RESTORE SKIP] Uplink selection skipped: {e}")
+            else:
+                print(f"[RESTORE ERROR] Uplink selection: {e}")
 
     # Threat protection / content filtering
     content = _load_json_if_exists(os.path.join(security_root, "content_filtering.json"))
@@ -1480,7 +1930,11 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             )
             print("[RESTORE] Malware protection restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] Malware protection: {e}")
+            err = str(e).lower()
+            if "not supported by this network" in err or "not supported" in err:
+                print(f"[RESTORE SKIP] Malware protection skipped: {e}")
+            else:
+                print(f"[RESTORE ERROR] Malware protection: {e}")
 
     intrusion = _load_json_if_exists(os.path.join(security_root, "security_intrusion.json"))
     if intrusion:
@@ -1488,19 +1942,35 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             dashboard.appliance.updateNetworkApplianceSecurityIntrusion(network_id, **intrusion)
             print("[RESTORE] Intrusion protection restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] Intrusion protection: {e}")
+            err = str(e).lower()
+            if "not supported by this network" in err or "not supported" in err:
+                print(f"[RESTORE SKIP] Intrusion protection skipped: {e}")
+            else:
+                print(f"[RESTORE ERROR] Intrusion protection: {e}")
 
     warm_spare = _load_json_if_exists(os.path.join(security_root, "warm_spare.json"))
     if warm_spare and "enabled" in warm_spare:
         try:
             warm_spare_payload = dict(warm_spare)
             warm_spare_enabled = warm_spare_payload.pop("enabled", False)
+            primary_serial = warm_spare_payload.get("primarySerial")
+            if primary_serial is None or primary_serial == "":
+                warm_spare_payload.pop("primarySerial", None)
+            elif not _is_valid_meraki_serial(primary_serial):
+                print("[RESTORE WARN] Warm spare skipped: invalid primarySerial in snapshot")
+                warm_spare_payload.pop("primarySerial", None)
+                warm_spare_enabled = False
             spare_serial = warm_spare_payload.get("spareSerial")
             if spare_serial is None or spare_serial == "":
                 warm_spare_payload.pop("spareSerial", None)
             elif not _is_valid_meraki_serial(spare_serial):
                 print("[RESTORE WARN] Warm spare skipped: invalid spareSerial in snapshot")
                 warm_spare_payload.pop("spareSerial", None)
+                warm_spare_enabled = False
+            if warm_spare_enabled and (
+                not warm_spare_payload.get("primarySerial") or not warm_spare_payload.get("spareSerial")
+            ):
+                print("[RESTORE WARN] Warm spare disabled: primary/spare serial missing")
                 warm_spare_enabled = False
             dashboard.appliance.updateNetworkApplianceWarmSpare(
                 network_id,
@@ -1509,7 +1979,11 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
             )
             print("[RESTORE] Warm spare restored")
         except Exception as e:
-            print(f"[RESTORE ERROR] Warm spare: {e}")
+            err = str(e).lower()
+            if "primary mx not found" in err or "not supported" in err:
+                print(f"[RESTORE SKIP] Warm spare skipped: {e}")
+            else:
+                print(f"[RESTORE ERROR] Warm spare: {e}")
 
     # Wireless concentrator related (if available in MX mode)
     mx_ssids = _load_json_if_exists(os.path.join(security_root, "mx_ssids.json")) or []
@@ -1538,14 +2012,12 @@ def restoreSecuritySdwanSettings(network_id, network_folder, dashboard):
 def fullDeepRestore(network_id, network_folder, dashboard, org_id=None, target_network=None):
     """
     Enterprise Disaster Recovery Restore Order:
-    1. Network-wide
+    1. Security & SD-WAN
     2. Wireless
-    3. SSIDs
-    4. Switch
+    3. Switch
     """
     print("========== FULL DEEP RESTORE START ==========")
 
-    restoreNetworkWide(network_id, network_folder, dashboard)
     restoreSecuritySdwanSettings(network_id, network_folder, dashboard)
     restoreWirelessComplete(network_id, network_folder, dashboard)
     restoreSwitch(
