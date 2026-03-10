@@ -12,6 +12,7 @@ backup/
 
 # Logs
 *.log
+auto_backup_settings.json
 
 # Python cache
 __pycache__/

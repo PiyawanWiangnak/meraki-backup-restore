@@ -60,6 +60,26 @@ select {
     margin-top: 20px;
 }
 
+.toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 18px;
+}
+
+.btn-secondary {
+    display: inline-block;
+    background: #111827;
+    color: white;
+    padding: 12px 18px;
+    border-radius: 10px;
+    text-decoration: none;
+    font-weight: bold;
+}
+
+.btn-secondary:hover {
+    background: #1f2937;
+}
+
 .btn-backup {
     flex: 1;
     background: #2c7be5;
@@ -223,6 +243,20 @@ Meraki Enterprise Backup & Restore (Snapshot-Based)
 
 <div class="container">
 <div id="statusToast" class="status-toast"></div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        {% for category, message in messages %}
+        <div class="status-toast {{ category if category in ['success', 'error', 'info'] else 'info' }}" style="display:block;">
+            {{ message }}
+        </div>
+        {% endfor %}
+    {% endif %}
+{% endwith %}
+
+<div class="toolbar">
+    <a class="btn-secondary" href="{{ url_for('auto_backup_settings') }}">Auto Backup Settings</a>
+</div>
 
 <!-- MAIN CONTROL PANEL -->
 <div class="card">

@@ -10,6 +10,8 @@ backup_tag = ''
 restore_tag = 'merakiRestore'
 backup_directory = './backup'
 log_directory = './logs'
+auto_backup_settings_file = './auto_backup_settings.json'
+auto_backup_task_name = 'MerakiBackupAuto'
 
 org_number_filter = ['898102']
 org_name_filter = ''
