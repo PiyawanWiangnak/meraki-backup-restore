@@ -2,13 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Meraki Enterprise Backup & Restore</title>
 
 <style>
+* {
+    box-sizing: border-box;
+}
+
 body {
     font-family: "Segoe UI", sans-serif;
     background: #f4f6f9;
     margin: 0;
+    color: #111827;
 }
 
 .header {
@@ -38,12 +44,30 @@ h2 {
     color: #2c3e50;
 }
 
+label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #334155;
+}
+
 select {
     width: 100%;
     padding: 12px;
     border-radius: 10px;
     border: 1px solid #ccc;
     font-size: 15px;
+    min-height: 48px;
+    background: #fff;
+}
+
+.field-group {
+    margin-top: 20px;
+}
+
+.field-group:first-of-type {
+    margin-top: 0;
 }
 
 .step {
@@ -56,6 +80,7 @@ select {
 
 .button-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 15px;
     margin-top: 20px;
 }
@@ -74,6 +99,7 @@ select {
     border-radius: 10px;
     text-decoration: none;
     font-weight: bold;
+    text-align: center;
 }
 
 .btn-secondary:hover {
@@ -102,6 +128,13 @@ select {
     font-size: 17px;
     font-weight: bold;
     cursor: pointer;
+}
+
+.btn-backup,
+.btn-restore,
+.btn-export-clients,
+.btn-export-inventory {
+    min-height: 52px;
 }
 
 .btn-backup:hover { background: #1a5fd1; }
@@ -232,6 +265,77 @@ select {
     to { transform: rotate(360deg); }
 }
 
+@media (max-width: 768px) {
+    .header {
+        padding: 16px 18px;
+        font-size: 18px;
+        line-height: 1.4;
+    }
+
+    .container {
+        margin: 0;
+        padding: 14px;
+    }
+
+    .card {
+        padding: 18px 16px;
+        border-radius: 12px;
+        margin-bottom: 14px;
+    }
+
+    .toolbar {
+        justify-content: stretch;
+    }
+
+    .btn-secondary {
+        width: 100%;
+    }
+
+    .button-row {
+        flex-direction: column;
+    }
+
+    .btn-backup,
+    .btn-restore,
+    .btn-export-clients,
+    .btn-export-inventory {
+        width: 100%;
+        flex: none;
+        font-size: 16px;
+    }
+
+    .logs {
+        height: 220px;
+        font-size: 12px;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .loading-box {
+        width: min(92vw, 360px);
+        min-width: 0;
+        padding: 20px 18px;
+    }
+}
+
+@media (max-width: 480px) {
+    body {
+        font-size: 14px;
+    }
+
+    .container {
+        padding: 12px;
+    }
+
+    .step {
+        font-size: 14px;
+        line-height: 1.4;
+    }
+
+    select {
+        font-size: 16px;
+    }
+}
+
 </style>
 </head>
 
@@ -265,53 +369,65 @@ Meraki Enterprise Backup & Restore (Snapshot-Based)
     <form method="POST" action="/execute_action">
 
         <!-- STEP 1 -->
-        <div class="step">Step 1: Select Organization</div>
-        <select id="org_id" name="org_id" required>
-            {% for org in orgs %}
-            <option value="{{ org.id }}" {% if selected_org and selected_org|string == org.id|string %}selected{% endif %}>
-                {{ org.name }}
-            </option>
-            {% endfor %}
-        </select>
-
-        <!-- STEP 2 -->
-        <div class="step" style="margin-top:20px;">Step 2: Select Network</div>
-        <select name="network_id" required>
-            {% if networks %}
-                <option value="__all__" {% if selected_network == "__all__" %}selected{% endif %}>
-                    All networks
-                </option>
-                {% for net in networks %}
-                <option value="{{ net.id }}" {% if selected_network and selected_network|string == net.id|string %}selected{% endif %}>
-                    {{ net.name }}
+        <div class="field-group">
+            <div class="step">Step 1: Select Organization</div>
+            <label for="org_id">Organization</label>
+            <select id="org_id" name="org_id" required>
+                {% for org in orgs %}
+                <option value="{{ org.id }}" {% if selected_org and selected_org|string == org.id|string %}selected{% endif %}>
+                    {{ org.name }}
                 </option>
                 {% endfor %}
-            {% else %}
-                <option disabled selected>-- Load networks first --</option>
-            {% endif %}
-        </select>
+            </select>
+        </div>
+
+        <!-- STEP 2 -->
+        <div class="field-group">
+            <div class="step">Step 2: Select Network</div>
+            <label for="network_id">Network</label>
+            <select id="network_id" name="network_id" required>
+                {% if networks %}
+                    <option value="__all__" {% if selected_network == "__all__" %}selected{% endif %}>
+                        All networks
+                    </option>
+                    {% for net in networks %}
+                    <option value="{{ net.id }}" {% if selected_network and selected_network|string == net.id|string %}selected{% endif %}>
+                        {{ net.name }}
+                    </option>
+                    {% endfor %}
+                {% else %}
+                    <option disabled selected>-- Load networks first --</option>
+                {% endif %}
+            </select>
+        </div>
 
         <!-- STEP 3 -->
-        <div class="step" style="margin-top:20px;">Step 3: Backup / Restore Options</div>
-        <select id="backup_mode" name="backup_mode" required>
-            <option value="wireless" {% if selected_backup_mode == "wireless" %}selected{% endif %}>Wireless Backup (SSID + Security + RF)</option>
-            <option value="security_sdwan" {% if selected_backup_mode == "security_sdwan" %}selected{% endif %}>Security &amp; SD-WAN Backup (MX Configure + Firmware + Monitor Snapshot)</option>
-            <option value="switching" {% if selected_backup_mode == "switching" %}selected{% endif %}>Switching Backup (Full + Clients/Usage CSV + SM Inventory CSV)</option>
-            <option value="full_enterprise" {% if selected_backup_mode == "full_enterprise" %}selected{% endif %}>Full Enterprise Backup (MR + MX + MS)</option>
-        </select>
+        <div class="field-group">
+            <div class="step">Step 3: Backup / Restore Options</div>
+            <label for="backup_mode">Backup / Restore Mode</label>
+            <select id="backup_mode" name="backup_mode" required>
+                <option value="wireless" {% if selected_backup_mode == "wireless" %}selected{% endif %}>Wireless Backup (SSID + Security + RF)</option>
+                <option value="security_sdwan" {% if selected_backup_mode == "security_sdwan" %}selected{% endif %}>Security &amp; SD-WAN Backup (MX Configure + Firmware + Monitor Snapshot)</option>
+                <option value="switching" {% if selected_backup_mode == "switching" %}selected{% endif %}>Switching Backup (Full + Clients/Usage CSV + SM Inventory CSV)</option>
+                <option value="full_enterprise" {% if selected_backup_mode == "full_enterprise" %}selected{% endif %}>Full Enterprise Backup (MR + MX + MS)</option>
+            </select>
+        </div>
 
         <!-- STEP 4 -->
-        <div class="step" style="margin-top:20px;">Step 4: Select Snapshot For Restore</div>
-        <select id="snapshot_name" name="snapshot_name">
-            <option value="" {% if not selected_snapshot %}selected{% endif %}>
-                Please select file (Latest auto)
-            </option>
-            {% for snap in snapshots %}
-            <option value="{{ snap }}" {% if selected_snapshot and selected_snapshot == snap %}selected{% endif %}>
-                {{ snap }}
-            </option>
-            {% endfor %}
-        </select>
+        <div class="field-group">
+            <div class="step">Step 4: Select Snapshot For Restore</div>
+            <label for="snapshot_name">Snapshot File</label>
+            <select id="snapshot_name" name="snapshot_name">
+                <option value="" {% if not selected_snapshot %}selected{% endif %}>
+                    Please select file (Latest auto)
+                </option>
+                {% for snap in snapshots %}
+                <option value="{{ snap }}" {% if selected_snapshot and selected_snapshot == snap %}selected{% endif %}>
+                    {{ snap }}
+                </option>
+                {% endfor %}
+            </select>
+        </div>
         <!-- ACTION BUTTONS -->
         <div class="button-row">
             <button type="submit" name="action" value="backup" class="btn-backup">
